@@ -72,9 +72,8 @@ project itself, so there is no server to run and no database to maintain.
 
 Tracker data lives in Prism's own per-entity metadata (`Shotinfo` /
 `Assetinfo`), so it travels with the project and is shared by everyone
-working on it. Saves re-read the newest data before merging and only write
-rows that actually changed, so two people editing at once do not clobber each
-other.
+working on it. Saves re-read the newest data and only write the fields you
+actually changed, so two people editing at once do not clobber each other.
 
 ---
 
@@ -165,11 +164,11 @@ Studio                        (sequence)
       Compositing  Task   Not started
 ```
 
-- Each **task** is the tracked row — status, assignee, due date, description
-  and its own comment thread.
+- Each **task** is the tracked row — status, assignee, due date, a task
+  description and its own comment thread.
 - The **shot** becomes a summary: how many of its tasks are complete, and the
-  earliest outstanding due date. Its own controls are hidden so there is one
-  obvious place to set each thing.
+  earliest outstanding due date. Its **description** and **frame range** stay
+  editable on that row, since they belong to the shot rather than to a task.
 - The **Department** column is hidden, since the tree groups by department
   already.
 - FX layers are a shot-mode feature and are not offered here.
@@ -196,6 +195,10 @@ but each mode only shows what was entered in that mode:
 
 Nothing is deleted when you switch, and per-task data sits alongside whatever
 else Prism keeps in that file.
+
+The shot/asset **description** and the shot **frame range** are the exception:
+they are Prism's own fields, so both modes read and write the same values. A
+task's description is separate and only shown in task mode.
 
 ---
 
@@ -271,6 +274,11 @@ The project config (`pipeline.json`) is **never** written.
   entities are never affected.
 - Comment threads **merge** rather than overwrite, so two people commenting on
   the same entity at once do not clobber each other.
+- Other fields merge **field by field**: a save only writes what you changed,
+  and takes everything else from what is stored at that moment. Changing a
+  due date never puts back an old status that someone else has since
+  updated, even if your window has not shown their change yet. FX layers
+  merge the same way, layer by layer.
 - Only rows that actually changed are written.
 
 ### Things to know
@@ -287,9 +295,16 @@ The project config (`pipeline.json`) is **never** written.
 - **Deleting an entity from the tracker** removes its entry from Prism's shot
   or asset info file, and removes the (empty) folder. That is a real deletion
   of Prism data, and it asks first.
-- **Concurrency.** Saves re-read before merging, but the entity-info files are
-  rewritten whole rather than patched in place. Two people saving the *same*
-  entity in the same instant is the one case that can lose an edit.
+- **Concurrency.** If two people change the *same field* of the same row, the
+  later save wins and the status bar names the field that was also changed
+  by someone else. The entity-info files are rewritten whole rather than
+  patched in place, so two saves landing in the very same instant can still
+  lose one of them.
+- **Seeing other people's changes.** One-task-per-shot mode checks for them
+  every few seconds. Task mode keeps each task in its own file, so it checks
+  those files' timestamps in the background every 30 seconds; press Refresh
+  to see changes sooner. Saving does not depend on this, since every save
+  merges against the files as they are at that moment.
 
 ### Known Prism behaviour to be aware of
 

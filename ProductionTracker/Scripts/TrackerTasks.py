@@ -122,6 +122,22 @@ class TrackerTasks(object):
             return []
 
     @err_catcher(name=__name__)
+    def departmentsFolder(self, entity):
+        """Folder holding an entity's department folders (or '')."""
+        try:
+            return self.core.getEntityPath(entity=entity, reqEntity="step") or ""
+        except Exception:
+            return ""
+
+    @err_catcher(name=__name__)
+    def departmentFolder(self, entity, department):
+        """Folder holding a department's task folders (or '')."""
+        try:
+            return self.core.getEntityPath(entity=entity, step=department) or ""
+        except Exception:
+            return ""
+
+    @err_catcher(name=__name__)
     def taskFolder(self, entity, department, task):
         """Folder on disk holding a task (or '')."""
         try:

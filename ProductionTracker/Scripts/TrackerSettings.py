@@ -77,7 +77,9 @@ APPROVED_COLOR = "#22c55e"
 #               becomes a rollup of the tasks under it.
 #
 #  The two modes read and write different places, so switching is lossless
-#  but each mode only shows what was entered in that mode.
+#  but each mode only shows what was entered in that mode. The exception is
+#  the entity's own description and frame range, which are Prism's fields
+#  and are read and written in the same place by both modes.
 # ---------------------------------------------------------------------------
 MODE_SHOT = "shot"
 MODE_TASKS = "tasks"

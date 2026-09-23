@@ -395,7 +395,9 @@ class TrackerConfigDlg(QDialog):
                 "summary of the tasks under it. The Department column is "
                 "hidden, since the tree groups by department instead. Task "
                 "data is stored with the task, so it is separate from "
-                "anything entered in the other mode."
+                "anything entered in the other mode. A shot's description "
+                "and frame range are Prism's own and are shared by both "
+                "modes."
             )
         else:
             self.l_modeHint.setText(

@@ -41,6 +41,7 @@ import os
 import copy
 import datetime
 import shutil
+import threading
 import time
 import uuid
 
@@ -90,6 +91,21 @@ TASK_KEYS = {
     "desc": DESC_KEY,
     "notes": NOTES_KEY,
 }
+
+# The single-value fields of a row. On save each one is merged against what
+# is on disk at that moment (see mergeRowValues): a field this user did not
+# touch takes the stored value, so an edit to one field never writes a stale
+# copy of the others over someone else's newer change. Comments are merged
+# separately, by comment id (TrackerComments.merge_comments).
+ENTITY_FIELDS = ("assignee", "status", "department", "due", "range", "desc")
+TASK_FIELDS = ("assignee", "status", "due", "desc")
+FX_FIELDS = ("name", "assignee", "status", "due", "desc")
+
+# How often (seconds) task mode checks the task folders and info files for
+# changes made by other users. Only file timestamps are read, on a background
+# thread, so it is light even on a network share. Shot mode doesn't need this:
+# all of its data lives in the two files checked every few seconds.
+TASK_POLL_INTERVAL = 30
 
 # --- Status options and their accent colors --------------------------------
 # Fixed: the same five states everywhere, so a status always means the same
@@ -182,6 +198,14 @@ ROLE_DEPT = Qt.UserRole + 10
 
 THUMB_W = 96
 THUMB_H = 54
+
+
+def statMtime(path):
+    """A file or folder's modification time, 0 when it doesn't exist."""
+    try:
+        return os.path.getmtime(path)
+    except (OSError, ValueError):
+        return 0
 
 
 class RowTintDelegate(QStyledItemDelegate):
@@ -951,6 +975,22 @@ class ProductionTrackerDlg(QDialog):
         self.userMgmtEnabled = False
         self._repairedShowFlags = False
         self._warnedAssetNames = False
+        # Set while a save pushes merged values back into the row widgets,
+        # so those programmatic changes don't queue another autosave.
+        self._applyingRemote = False
+        # "label (field)" entries where this user and someone else changed
+        # the same field; reported in the status bar after a save.
+        self._conflicts = []
+        # Task mode change detection (see TASK_POLL_INTERVAL): path -> mtime
+        # as of the last rebuild, and the state of the background check.
+        self._taskWatch = {}
+        self._taskWatchGen = 0
+        self._taskPollThread = None
+        self._taskPollResult = None
+        self._taskChangesPending = False
+        self._lastTaskPoll = time.time()
+        # Assignees found on tasks while building (see addTaskAssignees).
+        self._taskAssignees = set()
         self.teamUsers = []
         self.currentUser = None
         self.avatarCache = {}
@@ -1376,6 +1416,38 @@ class ProductionTrackerDlg(QDialog):
         return names + sorted(extras)
 
     @err_catcher(name=__name__)
+    def addTaskAssignees(self):
+        """Offer assignees that are only found on tasks.
+
+        getAssigneeList() runs before the tree is built and only sees the
+        shot/asset metadata. Task files are read while building, so anyone
+        assigned to a task who is not on the roster is added to the assignee
+        filter and every row's dropdown afterwards, the same as a stray name
+        on a shot is in the other mode.
+        """
+        known = set(n.lower() for n in self.assigneeList)
+        for u in self.teamUsers:
+            if u.get("username"):
+                known.add(u["username"].lower())
+        extras = sorted(n for n in self._taskAssignees if n.lower() not in known)
+        if not extras:
+            return
+
+        self.assigneeList.extend(extras)
+        for item in self.iterLeafItems():
+            cb = self.cellWidget(item, COL_ASSIGNEE)
+            if cb is None:
+                continue
+            for name in extras:
+                if cb.findText(name) == -1:
+                    icon = self.avatarFor(name)
+                    if icon is not None:
+                        cb.addItem(icon, name)
+                    else:
+                        cb.addItem(name)
+        self.populateAssigneeFilter()
+
+    @err_catcher(name=__name__)
     def resolveAssignee(self, value):
         """Map a stored assignee to a roster full name.
 
@@ -1755,6 +1827,13 @@ class ProductionTrackerDlg(QDialog):
         self._notesItem = None
         self.tree.clear()
 
+        # Rebuilt below as task mode reads each task (see watchPath).
+        self._taskWatch = {}
+        self._taskWatchGen += 1
+        self._taskPollResult = None
+        self._taskChangesPending = False
+        self._taskAssignees = set()
+
         self.shotsRoot = self.makeSectionItem("SHOTS")
         self.buildShotTree(sequences, shots)
 
@@ -1769,6 +1848,7 @@ class ProductionTrackerDlg(QDialog):
                 parent, entity["_leafName"] = self.ensureAssetParent(entity["asset_path"])
             self.addEntityItem(parent, entity, isNew=True)
 
+        self.addTaskAssignees()
         self.updateNodeCounts()
         if preserve:
             self.restoreTreeState(preserve)
@@ -1834,6 +1914,8 @@ class ProductionTrackerDlg(QDialog):
 
     @err_catcher(name=__name__)
     def onSyncTick(self):
+        # Runs in the background; only flags _taskChangesPending.
+        self.pollTaskFiles()
         # Don't disturb the user while a dropdown/calendar popup is open.
         if self._syncing or QApplication.activePopupWidget() is not None:
             return
@@ -1847,8 +1929,71 @@ class ProductionTrackerDlg(QDialog):
             return
         if not getattr(self.core, "projectPath", None):
             return
-        if self.currentMtimes() != self._lastSyncMtimes:
+        if self._taskChangesPending or self.currentMtimes() != self._lastSyncMtimes:
             self.liveSync()
+
+    # ---------------------------------------------------- task mode watch ---
+    @err_catcher(name=__name__)
+    def watchPath(self, path):
+        """Record a path's current mtime for task-mode change detection."""
+        if path:
+            path = os.path.normpath(path)
+            self._taskWatch[path] = statMtime(path)
+
+    @err_catcher(name=__name__)
+    def markTaskFileSeen(self, entity, department, task):
+        """After writing a task file ourselves, so it isn't taken for a
+        change by someone else and trigger a needless rebuild."""
+        self.watchPath(self.tasks.dataPath(entity, department, task))
+
+    @err_catcher(name=__name__)
+    def pollTaskFiles(self):
+        """Task mode: notice what other users changed in task files.
+
+        Shot mode data lives in two files that are cheap to check every
+        tick, but task mode keeps each task in its own file, plus new tasks
+        and departments appear as new folders. Checking those is only a
+        timestamp read per path, but there can be hundreds on a network
+        share, so it runs on a background thread every TASK_POLL_INTERVAL
+        seconds. This picks up the finished result on a later tick and flags
+        a rebuild, which onSyncTick() performs once nobody is mid-edit.
+
+        This is only about seeing other people's work sooner: saving never
+        depends on it, because every save merges against the files as they
+        are at that moment (see mergeRowValues).
+        """
+        if not self.taskMode() or not self._taskWatch:
+            return
+
+        result = self._taskPollResult
+        if result is not None:
+            self._taskPollResult = None
+            gen, mtimes = result
+            # A result started before the last rebuild compares against the
+            # wrong baseline; drop it.
+            if gen == self._taskWatchGen and any(
+                self._taskWatch.get(p) != m for p, m in mtimes.items()
+            ):
+                self._taskChangesPending = True
+
+        if self._taskPollThread is not None and self._taskPollThread.is_alive():
+            return
+        if time.time() - self._lastTaskPoll < TASK_POLL_INTERVAL:
+            return
+        self._lastTaskPoll = time.time()
+
+        paths = list(self._taskWatch)
+        gen = self._taskWatchGen
+
+        def run():
+            # Plain file-system calls only - nothing here may touch Qt.
+            self._taskPollResult = (gen, dict((p, statMtime(p)) for p in paths))
+
+        self._taskPollThread = threading.Thread(
+            target=run, name="ProductionTrackerTaskPoll"
+        )
+        self._taskPollThread.daemon = True
+        self._taskPollThread.start()
 
     @err_catcher(name=__name__)
     def liveSync(self):
@@ -1919,12 +2064,20 @@ class ProductionTrackerDlg(QDialog):
             "selected": None,
         }
 
-        for item in self.iterLeafItems():
-            if item.data(0, ROLE_ISNEW):
-                continue  # new rows survive via self.newRows
-            if self.isDirty(item):
-                entity = item.data(0, ROLE_ENTITY)
-                state["dirty"][self.entityKey(entity)] = self.getRowValues(item)
+        # Only the fields actually edited are kept, so re-applying them after
+        # the rebuild can't put stale copies of the other fields back over
+        # newer values just read from disk. New rows themselves are rebuilt
+        # from self.newRows, but what has been typed into them only survives
+        # by being captured here too.
+        for item in self.iterLeafItems() + self.rollupItems():
+            if not self.isDirty(item):
+                continue
+            snap = item.data(0, ROLE_SNAPSHOT) or {}
+            edited = {
+                k: v for k, v in self.getRowValues(item).items() if v != snap.get(k)
+            }
+            if edited:
+                state["dirty"][self.entityKey(item.data(0, ROLE_ENTITY))] = edited
 
         def walkNodes(parent):
             for i in range(parent.childCount()):
@@ -1937,7 +2090,7 @@ class ProductionTrackerDlg(QDialog):
         walkNodes(self.tree.invisibleRootItem())
 
         sel = self.tree.currentItem()
-        if sel is not None and sel.data(0, ROLE_ISLEAF):
+        if sel is not None and (sel.data(0, ROLE_ISLEAF) or sel.data(0, ROLE_ROLLUP)):
             state["selected"] = self.entityKey(sel.data(0, ROLE_ENTITY))
         return state
 
@@ -1946,11 +2099,17 @@ class ProductionTrackerDlg(QDialog):
         # Re-apply unsaved local edits so live sync never discards them.
         dirty = state.get("dirty", {})
         selectItem = None
-        for item in self.iterLeafItems():
+        for item in self.iterLeafItems() + self.rollupItems():
             entity = item.data(0, ROLE_ENTITY)
             key = self.entityKey(entity)
             if key in dirty:
-                self.setRowValues(item, dirty[key])
+                values = dict(dirty[key])
+                if "notes" in values:
+                    # Keep comments that arrived with the rebuild as well.
+                    values["notes"] = TrackerComments.merge_comments(
+                        item.data(0, ROLE_NOTES), values["notes"]
+                    )
+                self.setRowValues(item, values)
             if state.get("selected") is not None and key == state["selected"]:
                 selectItem = item
 
@@ -1967,7 +2126,7 @@ class ProductionTrackerDlg(QDialog):
         if expanded:
             walkNodes(self.tree.invisibleRootItem())
         else:
-            self.tree.expandToDepth(2)
+            self.tree.expandToDepth(3 if self.taskMode() else 2)
 
         if selectItem is not None:
             self.tree.setCurrentItem(selectItem)
@@ -1976,43 +2135,52 @@ class ProductionTrackerDlg(QDialog):
 
     @err_catcher(name=__name__)
     def setRowValues(self, item, values):
-        assigneeCb = self.cellWidget(item, COL_ASSIGNEE)
-        if assigneeCb is not None:
-            assigneeCb.setCurrentText(values.get("assignee", ""))
-        statusCb = self.cellWidget(item, COL_STATUS)
-        if statusCb is not None:
-            statusCb.setCurrentText(values.get("status", STATUS_NOT_STARTED))
-        deptCb = self.cellWidget(item, COL_DEPARTMENT)
-        if deptCb is not None:
-            deptCb.setCurrentText(values.get("department", DEPT_NONE))
+        """Show `values` in a row's widgets.
+
+        Only the keys present are applied, and a widget that already shows
+        the value is left alone, so a field someone is typing in keeps its
+        cursor when a save or sync pushes the same value back into it.
+        """
+        entity = item.data(0, ROLE_ENTITY) or {}
+
+        def setText(widget, key):
+            if widget is not None and key in values and widget.text() != values[key]:
+                widget.setText(values[key])
+
+        def setCombo(widget, key):
+            if (
+                widget is not None
+                and key in values
+                and widget.currentText() != values[key]
+            ):
+                widget.setCurrentText(values[key])
+
+        setCombo(self.cellWidget(item, COL_ASSIGNEE), "assignee")
+        setCombo(self.cellWidget(item, COL_STATUS), "status")
+        setCombo(self.cellWidget(item, COL_DEPARTMENT), "department")
+
         dueW = self.cellWidget(item, COL_DUE)
-        if dueW is not None:
-            iso = values.get("due", "")
+        if dueW is not None and "due" in values and dueW.isoDate() != values["due"]:
+            iso = values["due"]
             if iso:
                 d = QDate.fromString(iso, "yyyy-MM-dd")
                 if d.isValid():
                     dueW.dateEdit.setDate(d)
             else:
                 dueW.clear()
-        entity = item.data(0, ROLE_ENTITY)
+
         if entity.get("type") == "shot":
-            rangeEdit = self.cellWidget(item, COL_RANGE)
-            if rangeEdit is not None:
-                rangeEdit.setText(values.get("range", ""))
+            setText(self.cellWidget(item, COL_RANGE), "range")
         if entity.get("type") == "fxlayer":
-            nameEdit = self.cellWidget(item, COL_NAME)
-            if nameEdit is not None:
-                nameEdit.setText(values.get("name", ""))
+            setText(self.cellWidget(item, COL_NAME), "name")
+        setText(self.cellWidget(item, COL_DESC), "desc")
 
-        descEdit = self.cellWidget(item, COL_DESC)
-        if descEdit is not None:
-            descEdit.setText(values.get("desc", ""))
-
-        notesVal = values.get("notes") or TrackerComments.empty_data()
-        item.setData(0, ROLE_NOTES, notesVal)
-        self.updateCommentIndicator(item)
-        if item is self._notesItem:
-            self.commentsPanel.refreshData(notesVal)
+        if "notes" in values:
+            notesVal = values["notes"] or TrackerComments.empty_data()
+            item.setData(0, ROLE_NOTES, notesVal)
+            self.updateCommentIndicator(item)
+            if item is self._notesItem:
+                self.commentsPanel.refreshData(notesVal)
 
     # ---------------------------------------------------------- notes panel -
     @err_catcher(name=__name__)
@@ -2065,7 +2233,7 @@ class ProductionTrackerDlg(QDialog):
     @err_catcher(name=__name__)
     def scheduleAutoSave(self, *args):
         """(Re)start the debounced auto-save countdown after an edit."""
-        if self._building:
+        if self._building or self._applyingRemote:
             return
         self.saveTimer.start()
 
@@ -2082,10 +2250,19 @@ class ProductionTrackerDlg(QDialog):
 
         saved = 0
         errors = []
+        self._conflicts = []
         for item in self.iterLeafItems():
             if item.data(0, ROLE_ISNEW):
                 continue
             ok, errs = self.writeExistingItem(item)
+            if ok:
+                saved += 1
+            errors.extend(errs)
+
+        for item in self.rollupItems():
+            if item.data(0, ROLE_ISNEW):
+                continue
+            ok, errs = self.writeRollupItem(item)
             if ok:
                 saved += 1
             errors.extend(errs)
@@ -2100,6 +2277,8 @@ class ProductionTrackerDlg(QDialog):
 
             stamp = datetime.datetime.now().strftime("%H:%M:%S")
             self.l_status.setText("Auto-saved %d change(s) at %s" % (saved, stamp))
+        if self._conflicts:
+            self.l_status.setText(self.conflictMessage())
         if errors:
             self.l_status.setText("Auto-save issue: %s" % errors[0])
 
@@ -2242,9 +2421,103 @@ class ProductionTrackerDlg(QDialog):
 
         return TrackerComments.merge_comments(remoteNotes, localNotes)
 
+    # --------------------------------------------------------------- merge --
+    @err_catcher(name=__name__)
+    def shortEntityLabel(self, entity):
+        """notifyEntityLabel() without the project name, for the status bar."""
+        label = self.notifyEntityLabel(entity)
+        project = getattr(self.core, "projectName", "") or ""
+        prefix = project + " / "
+        return label[len(prefix):] if project and label.startswith(prefix) else label
+
+    @err_catcher(name=__name__)
+    def entityFieldValues(self, entity, meta, isNew=False):
+        """A shot/asset's stored fields, normalised the way its row shows them."""
+        department = meta.get(DEPT_KEY, {}).get("value", DEPT_NONE)
+        return {
+            "assignee": self.resolveAssignee(meta.get(ASSIGNEE_KEY, {}).get("value", "")),
+            "status": meta.get(STATUS_KEY, {}).get("value", STATUS_NOT_STARTED),
+            "department": DEPARTMENT_RENAMES.get(department, department),
+            "due": meta.get(DUE_KEY, {}).get("value", ""),
+            "range": (
+                self.shotRangeText(entity, isNew) if entity.get("type") == "shot" else ""
+            ),
+            "desc": "" if isNew else self.getEntityDescription(entity, meta),
+        }
+
+    @err_catcher(name=__name__)
+    def taskFieldValues(self, data):
+        """A task's stored fields (from its info file), normalised likewise."""
+        return {
+            "assignee": self.resolveAssignee(data.get(TASK_KEYS["assignee"], "") or ""),
+            "status": data.get(TASK_KEYS["status"], "") or STATUS_NOT_STARTED,
+            "due": data.get(TASK_KEYS["due"], "") or "",
+            "desc": data.get(TASK_KEYS["desc"], "") or "",
+        }
+
+    @err_catcher(name=__name__)
+    def mergeRowValues(self, values, snapshot, stored, fields, label):
+        """Three-way merge of a row against what is stored right now.
+
+        `values` is what the row shows, `snapshot` what was stored when this
+        window last read or saved it, `stored` what is stored at this moment.
+
+        A field this user left alone takes the stored value, so someone
+        else's newer change to it survives instead of being overwritten by
+        this window's stale copy. A field both changed keeps this user's value
+        (the later save wins) and is recorded in self._conflicts so the
+        status bar can say so.
+        """
+        merged = dict(values)
+        for key in fields:
+            if key not in stored:
+                continue
+            mine, base, theirs = values.get(key), snapshot.get(key), stored[key]
+            if mine == base:
+                merged[key] = theirs
+            elif theirs != base and theirs != mine:
+                self._conflicts.append("%s (%s)" % (label, key))
+        return merged
+
+    @err_catcher(name=__name__)
+    def applySavedValues(self, item, values):
+        """After a save: show the merged result and make it the new baseline.
+
+        Fields merged in from someone else's save are pushed into the
+        widgets, and the snapshot is taken from the widgets afterwards so it
+        matches exactly what getRowValues() will report on the next check.
+        """
+        self._applyingRemote = True
+        try:
+            self.setRowValues(item, values)
+        finally:
+            self._applyingRemote = False
+        snapshot = self.getRowValues(item)
+        snapshot["notes"] = copy.deepcopy(snapshot.get("notes"))
+        item.setData(0, ROLE_SNAPSHOT, snapshot)
+
+    @err_catcher(name=__name__)
+    def conflictMessage(self):
+        """Status bar note for fields both this user and someone else changed."""
+        if not self._conflicts:
+            return ""
+        shown = self._conflicts[:3]
+        more = len(self._conflicts) - len(shown)
+        return "Also changed by someone else, your value was kept: %s%s" % (
+            ", ".join(shown),
+            " and %d more" % more if more > 0 else "",
+        )
+
+    # ---------------------------------------------------------------- write --
     @err_catcher(name=__name__)
     def writeExistingItem(self, item):
         """Persist a single existing entity's changed fields; updates snapshot.
+
+        Every field is merged against a fresh read (see mergeRowValues), so
+        only what this user changed is written and whatever someone else has
+        saved to the other fields in the meantime survives. Comments merge by
+        id against the same fresh copy, so a concurrent comment/reply from
+        another session is never clobbered either.
 
         Returns (savedBool, [errorStrings]).
         """
@@ -2262,15 +2535,44 @@ class ProductionTrackerDlg(QDialog):
         if entity.get("type") == "task":
             return self.writeTaskItem(item, entity, snapshot, values)
 
-        changed = any(
-            values.get(k) != snapshot.get(k)
-            for k in ("assignee", "status", "department", "due", "range", "desc", "notes")
-        )
-        if not changed:
+        if all(values.get(k) == snapshot.get(k) for k in ENTITY_FIELDS + ("notes",)):
             return (False, errors)
 
-        # Frame range for shots (only when it changed).
-        if entity.get("type") == "shot" and values["range"] != snapshot.get("range"):
+        try:
+            meta = self.core.entities.getMetaData(entity) or {}
+            stored = self.entityFieldValues(entity, meta)
+            values = self.mergeRowValues(
+                values, snapshot, stored, ENTITY_FIELDS, self.shortEntityLabel(entity)
+            )
+            errors.extend(self.writeRangeAndAssetDesc(entity, values, stored))
+            values["notes"] = self.processNotesForSave(
+                entity, self.notifyEntityLabel(entity), meta, values, snapshot
+            )
+            meta[STATUS_KEY] = {"value": values["status"], "show": True}
+            meta[ASSIGNEE_KEY] = {"value": values["assignee"], "show": True}
+            meta[DEPT_KEY] = {"value": values["department"], "show": True}
+            meta[DUE_KEY] = {"value": values["due"], "show": True}
+            meta[NOTES_KEY] = {"value": values["notes"], "show": False}
+            if entity.get("type") == "shot":
+                meta[DESC_KEY] = {"value": values["desc"], "show": True}
+            self.core.entities.setMetaData(entity=entity, metaData=meta)
+        except Exception as e:
+            errors.append("%s (meta): %s" % (self.leafDisplayName(entity, False), e))
+            return (False, errors)
+
+        self.applySavedValues(item, values)
+        return (True, errors)
+
+    @err_catcher(name=__name__)
+    def writeRangeAndAssetDesc(self, entity, values, stored):
+        """Write a shot's frame range / an asset's description if they differ
+        from what is stored.
+
+        Both go through Prism's own setters rather than the metadata block,
+        and are shared by the two tracker modes. Returns [errorStrings].
+        """
+        errors = []
+        if entity.get("type") == "shot" and values["range"] != stored.get("range"):
             frameRange = self.parseRange(values["range"])
             if frameRange:
                 try:
@@ -2279,99 +2581,105 @@ class ProductionTrackerDlg(QDialog):
                     errors.append("%s (range): %s" % (entity.get("shot"), e))
 
         # Asset descriptions live in Assetinfo (separate from metadata).
-        if entity.get("type") == "asset" and values["desc"] != snapshot.get("desc"):
+        if entity.get("type") == "asset" and values["desc"] != stored.get("desc"):
             try:
                 assetName = self.core.entities.getAssetNameFromPath(entity["asset_path"])
                 self.core.entities.setAssetDescription(assetName, values["desc"])
             except Exception as e:
                 errors.append("%s (desc): %s" % (self.leafDisplayName(entity, False), e))
+        return errors
 
-        # Status / assignee / due / notes (and shot description) via metadata.
-        # Re-read fresh so we only touch our own keys and preserve keys other
-        # users may have added since this window was opened. Comments merge
-        # (rather than overwrite) against that fresh copy so concurrent
-        # comments/replies from another session are never clobbered.
-        mergedNotes = values["notes"]
+    @err_catcher(name=__name__)
+    def writeRollupItem(self, item):
+        """Persist a task-mode shot/asset row's own fields.
+
+        Only the description and (for shots) the frame range belong to the
+        entity in task mode, and they are written to the same place the
+        one-row-per-shot mode uses, so both modes show the same values. The
+        shot description is patched into the metadata on its own, leaving
+        the shot-mode status/assignee/etc. keys in there untouched.
+
+        Returns (savedBool, [errorStrings]).
+        """
+        entity = item.data(0, ROLE_ENTITY)
+        snapshot = item.data(0, ROLE_SNAPSHOT) or {}
+        values = self.getRowValues(item)
+        fields = ("desc", "range")
+        if all(values.get(k) == snapshot.get(k) for k in fields):
+            return (False, [])
+
+        errors = []
         try:
             meta = self.core.entities.getMetaData(entity) or {}
-            label = self.notifyEntityLabel(entity)
-            mergedNotes = self.processNotesForSave(entity, label, meta, values, snapshot)
-            meta[STATUS_KEY] = {"value": values["status"], "show": True}
-            meta[ASSIGNEE_KEY] = {"value": values["assignee"], "show": True}
-            meta[DEPT_KEY] = {"value": values["department"], "show": True}
-            meta[DUE_KEY] = {"value": values["due"], "show": True}
-            meta[NOTES_KEY] = {"value": mergedNotes, "show": False}
-            if entity.get("type") == "shot":
+            stored = self.entityFieldValues(entity, meta)
+            values = self.mergeRowValues(
+                values, snapshot, stored, fields, self.shortEntityLabel(entity)
+            )
+            errors.extend(self.writeRangeAndAssetDesc(entity, values, stored))
+            if entity.get("type") == "shot" and values["desc"] != stored["desc"]:
                 meta[DESC_KEY] = {"value": values["desc"], "show": True}
-            self.core.entities.setMetaData(entity=entity, metaData=meta)
+                self.core.entities.setMetaData(entity=entity, metaData=meta)
         except Exception as e:
-            errors.append("%s (meta): %s" % (self.leafDisplayName(entity, False), e))
+            errors.append("%s (desc): %s" % (self.leafDisplayName(entity, False), e))
+
+        if errors:
+            # Keep the old snapshot so the next save retries.
             return (False, errors)
 
-        item.setData(0, ROLE_NOTES, copy.deepcopy(mergedNotes))
-        if item is self._notesItem:
-            self.commentsPanel.refreshData(mergedNotes)
-        values = dict(values)
-        values["notes"] = copy.deepcopy(mergedNotes)
-        item.setData(0, ROLE_SNAPSHOT, values)
+        self.applySavedValues(item, values)
         return (True, errors)
 
     @err_catcher(name=__name__)
     def writeTaskItem(self, item, entity, snapshot, values):
         """Persist one task row into its own info file.
 
-        Mirrors writeExistingItem: only writes when something changed, and
-        re-reads the file immediately before writing so that keys added by
-        Prism or by another artist survive, and so comments merge against the
-        freshest copy instead of overwriting a concurrent reply.
+        Mirrors writeExistingItem: only writes when something changed, merges
+        every field against the file as it is right now, and writes only the
+        keys that end up different, so keys added by Prism or by another
+        artist survive and comments merge instead of overwriting a
+        concurrent reply.
 
         Returns (savedBool, [errorStrings]).
         """
         errors = []
-        fields = ("assignee", "status", "due", "desc", "notes")
-        if all(values.get(k) == snapshot.get(k) for k in fields):
+        if all(values.get(k) == snapshot.get(k) for k in TASK_FIELDS + ("notes",)):
             return (False, errors)
 
         parent = entity.get("parent") or {}
         department = entity.get("department", "")
         task = entity.get("task", "")
 
-        mergedNotes = values["notes"]
         try:
             remote = self.tasks.read(parent, department, task)
+            stored = self.taskFieldValues(remote)
+            values = self.mergeRowValues(
+                values, snapshot, stored, TASK_FIELDS, self.shortEntityLabel(entity)
+            )
             # processNotesForSave expects Prism's metadata shape, so the flat
             # task keys are wrapped to match before merging/notifying.
+            remoteNotes = remote.get(TASK_KEYS["notes"])
             remoteMeta = {
-                NOTES_KEY: {"value": remote.get(TASK_KEYS["notes"])},
-                STATUS_KEY: {"value": remote.get(TASK_KEYS["status"], STATUS_NOT_STARTED)},
+                NOTES_KEY: {"value": remoteNotes},
+                STATUS_KEY: {"value": stored["status"]},
                 DEPT_KEY: {"value": DEPT_NONE},
             }
-            label = self.notifyEntityLabel(entity)
-            mergedNotes = self.processNotesForSave(
-                entity, label, remoteMeta, values, snapshot
+            values["notes"] = self.processNotesForSave(
+                entity, self.notifyEntityLabel(entity), remoteMeta, values, snapshot
             )
-            self.tasks.write(
-                parent,
-                department,
-                task,
-                {
-                    TASK_KEYS["status"]: values["status"],
-                    TASK_KEYS["assignee"]: values["assignee"],
-                    TASK_KEYS["due"]: values["due"],
-                    TASK_KEYS["desc"]: values["desc"],
-                    TASK_KEYS["notes"]: mergedNotes,
-                },
-            )
+
+            changes = {
+                TASK_KEYS[k]: values[k] for k in TASK_FIELDS if values[k] != stored[k]
+            }
+            if values["notes"] != TrackerComments.load_notes_value(remoteNotes):
+                changes[TASK_KEYS["notes"]] = values["notes"]
+            if changes:
+                self.tasks.write(parent, department, task, changes)
+                self.markTaskFileSeen(parent, department, task)
         except Exception as e:
             errors.append("%s / %s: %s" % (department, task, e))
             return (False, errors)
 
-        item.setData(0, ROLE_NOTES, copy.deepcopy(mergedNotes))
-        if item is self._notesItem:
-            self.commentsPanel.refreshData(mergedNotes)
-        values = dict(values)
-        values["notes"] = copy.deepcopy(mergedNotes)
-        item.setData(0, ROLE_SNAPSHOT, values)
+        self.applySavedValues(item, values)
         self.refreshRollupFor(item)
         return (True, errors)
 
@@ -2550,12 +2858,15 @@ class ProductionTrackerDlg(QDialog):
     def addTaskModeEntity(self, parent, entity, isNew=False):
         """A shot/asset as a rollup row, with department folders beneath it.
 
-        The entity itself is not editable here - each task under it is - so
-        this row summarises them instead (see refreshRollup).
+        Status, assignee and due date belong to each task under it, so the
+        row summarises those instead (see refreshRollup). The description
+        and frame range are the entity's own, though, so they stay editable
+        here and are stored exactly where the one-row-per-shot mode stores
+        them - the same values show up in both modes (see writeRollupItem).
 
         A row that has not been saved yet exists only in this window, so
-        there is nothing on disk to read a thumbnail, description or task
-        list from; it shows as pending until Save creates it in Prism.
+        there is nothing on disk to read a thumbnail or task list from; it
+        shows as pending until Save creates it in Prism.
         """
         item = QTreeWidgetItem(parent)
         item.setData(0, ROLE_ISLEAF, False)
@@ -2576,32 +2887,49 @@ class ProductionTrackerDlg(QDialog):
             item.setFont(COL_NAME, f)
             item.setForeground(COL_NAME, QBrush(QColor("#22c55e")))
             item.setToolTip(COL_NAME, "New - will be created in Prism on Save")
-            if entity.get("type") == "shot" and entity.get("_start") is not None:
-                item.setText(COL_RANGE, "%s-%s" % (entity["_start"], entity["_end"]))
-            else:
-                item.setText(COL_RANGE, "-")
+        else:
+            item.setData(0, ROLE_THUMB, self.getThumbnail(entity))
+            self.refreshRollupIcon(item)
+
+        desc = "" if isNew else self.getEntityDescription(entity)
+        self.tree.setItemWidget(item, COL_DESC, self.wrapCell(self.makeDescEdit(desc)))
+
+        rangeText = ""
+        if entity.get("type") == "shot":
+            rangeText = self.shotRangeText(entity, isNew)
+            self.tree.setItemWidget(
+                item, COL_RANGE, self.wrapCell(self.makeRangeEdit(rangeText))
+            )
+        else:
+            item.setText(COL_RANGE, "-")
             item.setForeground(COL_RANGE, QBrush(QColor("#6b7280")))
             item.setTextAlignment(COL_RANGE, Qt.AlignCenter)
+
+        # Same shape as a leaf snapshot so isDirty()/captureTreeState() treat
+        # both alike; only "desc" and "range" are ever written from it.
+        item.setData(
+            0,
+            ROLE_SNAPSHOT,
+            {
+                "assignee": "",
+                "status": STATUS_NOT_STARTED,
+                "department": DEPT_NONE,
+                "due": "",
+                "range": rangeText,
+                "desc": desc,
+                "notes": TrackerComments.empty_data(),
+            },
+        )
+
+        if isNew:
             self.refreshRollup(item)
             return item
 
-        item.setData(0, ROLE_THUMB, self.getThumbnail(entity))
-        self.refreshRollupIcon(item)
-
-        meta = self.core.entities.getMetaData(entity) or {}
-        item.setText(COL_DESC, self.getEntityDescription(entity, meta))
-        item.setForeground(COL_DESC, QBrush(QColor("#9ca3af")))
-
-        if entity.get("type") == "shot":
-            frange = self.core.entities.getShotRange(entity)
-            if frange:
-                item.setText(COL_RANGE, "%s-%s" % (frange[0], frange[1]))
-        else:
-            item.setText(COL_RANGE, "-")
-        item.setForeground(COL_RANGE, QBrush(QColor("#6b7280")))
-        item.setTextAlignment(COL_RANGE, Qt.AlignCenter)
-
+        # Watched for new departments/tasks. Stat before listing, so anything
+        # created in between is noticed rather than missed.
+        self.watchPath(self.tasks.departmentsFolder(entity))
         for abbreviation, longName in self.tasks.departments(entity):
+            self.watchPath(self.tasks.departmentFolder(entity, abbreviation))
             taskNames = self.tasks.tasks(entity, abbreviation)
             if not taskNames:
                 continue
@@ -2656,21 +2984,26 @@ class ProductionTrackerDlg(QDialog):
         item.setData(0, ROLE_ENTITY, taskEntity)
         item.setData(0, ROLE_ISNEW, False)
 
+        self.watchPath(self.tasks.dataPath(entity, department, task))
         data = self.tasks.read(entity, department, task)
 
         item.setText(COL_NAME, task)
         item.setText(COL_TYPE, "Task")
         item.setForeground(COL_TYPE, QBrush(QColor("#9ca3af")))
 
+        # The task's own note, kept in its info file. The shot's description
+        # (Prism's, shared with the other mode) is on the rollup row above.
         desc = data.get(TASK_KEYS["desc"], "") or ""
-        descEdit = QLineEdit()
-        descEdit.setPlaceholderText("Description...")
-        descEdit.setStyleSheet("QLineEdit{background: transparent;}")
-        descEdit.setText(desc)
-        descEdit.textEdited.connect(self.scheduleAutoSave)
+        descEdit = self.makeDescEdit(desc, placeholder="Task description...")
+        descEdit.setToolTip(
+            "Stored on this task only. The shot/asset description is on its "
+            "own row above."
+        )
         self.tree.setItemWidget(item, COL_DESC, self.wrapCell(descEdit))
 
         assignee = self.resolveAssignee(data.get(TASK_KEYS["assignee"], "") or "")
+        if assignee:
+            self._taskAssignees.add(assignee)
         assigneeCombo = self.makeAssigneeCombo(assignee)
         assigneeCombo.currentTextChanged.connect(
             lambda _t, it=item: self.onTaskRowChanged(it)
@@ -2907,6 +3240,35 @@ class ProductionTrackerDlg(QDialog):
         return cb
 
     @err_catcher(name=__name__)
+    def makeDescEdit(self, text, placeholder="Description..."):
+        edit = QLineEdit()
+        edit.setPlaceholderText(placeholder)
+        edit.setStyleSheet("QLineEdit{background: transparent;}")
+        edit.setText(text)
+        edit.textEdited.connect(self.scheduleAutoSave)
+        return edit
+
+    @err_catcher(name=__name__)
+    def makeRangeEdit(self, text):
+        edit = QLineEdit()
+        edit.setPlaceholderText("start-end")
+        edit.setStyleSheet("QLineEdit{background: transparent;}")
+        edit.setAlignment(Qt.AlignCenter)
+        edit.setText(text)
+        edit.textEdited.connect(self.scheduleAutoSave)
+        return edit
+
+    @err_catcher(name=__name__)
+    def shotRangeText(self, entity, isNew):
+        """'start-end' for a shot: from Prism, or from Add Shot if unsaved."""
+        if isNew:
+            if entity.get("_start") is not None and entity.get("_end") is not None:
+                return "%s-%s" % (entity["_start"], entity["_end"])
+            return ""
+        frange = self.core.entities.getShotRange(entity)
+        return "%s-%s" % (frange[0], frange[1]) if frange else ""
+
+    @err_catcher(name=__name__)
     def addLeafItem(self, parent, entity, isNew=False):
         item = QTreeWidgetItem(parent)
         item.setData(0, ROLE_ISLEAF, True)
@@ -2937,12 +3299,7 @@ class ProductionTrackerDlg(QDialog):
 
         # Description (imported from Prism)
         desc = "" if isNew else self.getEntityDescription(entity, meta)
-        descEdit = QLineEdit()
-        descEdit.setPlaceholderText("Description...")
-        descEdit.setStyleSheet("QLineEdit{background: transparent;}")
-        descEdit.setText(desc)
-        descEdit.textEdited.connect(self.scheduleAutoSave)
-        self.tree.setItemWidget(item, COL_DESC, self.wrapCell(descEdit))
+        self.tree.setItemWidget(item, COL_DESC, self.wrapCell(self.makeDescEdit(desc)))
 
         # Assignee
         assignee = self.resolveAssignee(meta.get(ASSIGNEE_KEY, {}).get("value", ""))
@@ -2971,20 +3328,10 @@ class ProductionTrackerDlg(QDialog):
         # Frame range (shots only)
         rangeText = ""
         if entity.get("type") == "shot":
-            rangeEdit = QLineEdit()
-            rangeEdit.setPlaceholderText("start-end")
-            rangeEdit.setStyleSheet("QLineEdit{background: transparent;}")
-            rangeEdit.setAlignment(Qt.AlignCenter)
-            if isNew:
-                if entity.get("_start") is not None and entity.get("_end") is not None:
-                    rangeText = "%s-%s" % (entity["_start"], entity["_end"])
-            else:
-                frange = self.core.entities.getShotRange(entity)
-                if frange:
-                    rangeText = "%s-%s" % (frange[0], frange[1])
-            rangeEdit.setText(rangeText)
-            rangeEdit.textEdited.connect(self.scheduleAutoSave)
-            self.tree.setItemWidget(item, COL_RANGE, self.wrapCell(rangeEdit))
+            rangeText = self.shotRangeText(entity, isNew)
+            self.tree.setItemWidget(
+                item, COL_RANGE, self.wrapCell(self.makeRangeEdit(rangeText))
+            )
         else:
             item.setText(COL_RANGE, "-")
             item.setForeground(COL_RANGE, QBrush(QColor("#6b7280")))
@@ -3071,11 +3418,7 @@ class ProductionTrackerDlg(QDialog):
         item.setForeground(COL_TYPE, QBrush(QColor("#c4b5fd")))
 
         # Description
-        descEdit = QLineEdit()
-        descEdit.setPlaceholderText("Description...")
-        descEdit.setStyleSheet("QLineEdit{background: transparent;}")
-        descEdit.setText(data.get("desc", "") or "")
-        descEdit.textEdited.connect(self.scheduleAutoSave)
+        descEdit = self.makeDescEdit(data.get("desc", "") or "")
         self.tree.setItemWidget(item, COL_DESC, self.wrapCell(descEdit))
 
         # Assignee (can differ from the parent shot's assignee).
@@ -3154,13 +3497,23 @@ class ProductionTrackerDlg(QDialog):
 
     @err_catcher(name=__name__)
     def writeFxLayers(self, shotItem):
-        """Persist a shot's FX layers into its metadata. Returns [errors]."""
+        """Persist a shot's FX layers into its metadata. Returns [errors].
+
+        Merged against the stored list the same way rows are (see
+        mergeFxLayers), so a layer someone else added, removed or edited
+        since this window read the shot is not undone by this save.
+        """
         entity = shotItem.data(0, ROLE_ENTITY) or {}
         if entity.get("type") != "shot":
             return []
-        layers = self.collectFxLayers(shotItem)
+        local = self.collectFxLayers(shotItem)
+        base = shotItem.data(0, ROLE_FXSNAPSHOT) or []
         try:
             meta = self.core.entities.getMetaData(entity) or {}
+            stored = meta.get(FXLAYERS_KEY, {}).get("value") or []
+            layers = self.mergeFxLayers(
+                local, base, stored, self.shortEntityLabel(entity)
+            )
             if layers:
                 meta[FXLAYERS_KEY] = {"value": layers, "show": False}
             else:
@@ -3168,8 +3521,115 @@ class ProductionTrackerDlg(QDialog):
             self.core.entities.setMetaData(entity=entity, metaData=meta)
         except Exception as e:
             return ["%s (fx): %s" % (self.leafDisplayName(entity, False), e)]
-        shotItem.setData(0, ROLE_FXSNAPSHOT, layers)
+
+        if layers != local:
+            # Someone else's changes were merged in: show them.
+            self.rebuildFxLayers(shotItem, layers)
+        else:
+            for child in self.fxChildren(shotItem):
+                child.setData(0, ROLE_SNAPSHOT, self.getRowValues(child))
+        shotItem.setData(0, ROLE_FXSNAPSHOT, self.collectFxLayers(shotItem))
         return []
+
+    @err_catcher(name=__name__)
+    def normalizeFxLayer(self, layer):
+        """A stored FX layer dict in the shape collectFxLayers() produces."""
+        return {
+            "id": layer.get("id"),
+            "name": (layer.get("name") or "").strip(),
+            "assignee": self.resolveAssignee(layer.get("assignee", "")),
+            "status": layer.get("status", STATUS_NOT_STARTED),
+            "department": self.deptFx,
+            "due": layer.get("due", "") or "",
+            "desc": layer.get("desc", "") or "",
+            "notes": TrackerComments.load_notes_value(layer.get("notes")),
+        }
+
+    @err_catcher(name=__name__)
+    def mergeFxLayers(self, local, base, stored, label):
+        """Three-way merge of a shot's FX layer list, layer by layer (by id).
+
+        local: what this window shows; base: what it last read or saved;
+        stored: what is on disk now. Layers added on either side are kept,
+        layers removed on either side are dropped - unless the other side
+        edited it meanwhile, in which case keeping it loses nothing. Fields of
+        a layer present everywhere merge like a row's (mergeRowValues).
+        """
+        baseById = dict((l.get("id"), l) for l in base)
+        storedById = dict(
+            (l.get("id"), self.normalizeFxLayer(l))
+            for l in stored
+            if isinstance(l, dict)
+        )
+        localIds = set(l.get("id") for l in local)
+
+        out = []
+        for layer in local:
+            lid = layer.get("id")
+            old = baseById.get(lid)
+            theirs = storedById.get(lid)
+            if old is None:
+                out.append(layer)  # added here
+            elif theirs is None:
+                if layer != old:
+                    out.append(layer)  # removed there, but edited here
+            else:
+                merged = self.mergeRowValues(
+                    layer,
+                    old,
+                    theirs,
+                    FX_FIELDS,
+                    "%s / %s" % (label, layer.get("name") or "FX"),
+                )
+                merged["notes"] = TrackerComments.merge_comments(
+                    theirs["notes"], layer.get("notes")
+                )
+                out.append(merged)
+
+        for lid, theirs in storedById.items():
+            if lid in localIds:
+                continue
+            old = baseById.get(lid)
+            if old is None or theirs != old:
+                out.append(theirs)  # added there, or removed here but edited there
+        return out
+
+    @err_catcher(name=__name__)
+    def fxChildren(self, shotItem):
+        return [
+            shotItem.child(i)
+            for i in range(shotItem.childCount())
+            if (shotItem.child(i).data(0, ROLE_ENTITY) or {}).get("type") == "fxlayer"
+        ]
+
+    @err_catcher(name=__name__)
+    def rebuildFxLayers(self, shotItem, layers):
+        """Replace a shot's FX rows with `layers`, keeping the selection."""
+        current = self.tree.currentItem()
+        selectedId = None
+        if current is not None and current.parent() is shotItem:
+            selectedId = (current.data(0, ROLE_ENTITY) or {}).get("fx_id")
+
+        self._applyingRemote = True
+        try:
+            for child in self.fxChildren(shotItem):
+                if child is self._notesItem:
+                    self._notesItem = None
+                shotItem.removeChild(child)
+            reselect = None
+            for layer in layers:
+                row = self.addFxLayerItem(shotItem, layer)
+                if layer.get("id") == selectedId:
+                    reselect = row
+        finally:
+            self._applyingRemote = False
+
+        self.applyFilter()
+        self.updateStatusLabel()
+        if reselect is not None:
+            self.tree.setCurrentItem(reselect)
+        else:
+            self.updateNotesPanel()
 
     @err_catcher(name=__name__)
     def saveAllFxLayers(self):
@@ -3220,6 +3680,12 @@ class ProductionTrackerDlg(QDialog):
             self.core.popup("\n".join(errs), parent=self)
         else:
             self._lastSyncMtimes = self.currentMtimes()
+        # The save may have rebuilt the FX rows (merging in someone else's
+        # changes), so look the new row up again rather than reuse `item`.
+        for child in self.fxChildren(shotItem):
+            if (child.data(0, ROLE_ENTITY) or {}).get("fx_id") == data["id"]:
+                item = child
+                break
         self.applyFilter()
         self.updateStatusLabel()
         self.tree.setCurrentItem(item)
@@ -3624,6 +4090,7 @@ class ProductionTrackerDlg(QDialog):
         entity = item.data(0, ROLE_ENTITY) or {}
         etype = entity.get("type")
         isLeaf = bool(item.data(0, ROLE_ISLEAF))
+        isRollup = bool(item.data(0, ROLE_ROLLUP))
         section = self.sectionOf(item)
         dept = item.data(0, ROLE_DEPT)
 
@@ -3641,9 +4108,9 @@ class ProductionTrackerDlg(QDialog):
                 lambda: self.addTaskTo(item, department=dept[0])
             )
             menu.addSeparator()
-        elif self.taskMode() and (item.data(0, ROLE_ROLLUP) or etype == "task"):
+        elif self.taskMode() and (isRollup or etype == "task"):
             actAddTask = menu.addAction("Add Task...")
-            node = item if item.data(0, ROLE_ROLLUP) else self.rollupAncestor(item)
+            node = item if isRollup else self.rollupAncestor(item)
             if node is not None and node.data(0, ROLE_ISNEW):
                 # Its folders do not exist yet, so Prism has nowhere to
                 # create a department in.
@@ -3654,7 +4121,11 @@ class ProductionTrackerDlg(QDialog):
             else:
                 actAddTask.triggered.connect(lambda: self.addTaskTo(item))
             menu.addSeparator()
-        elif section == "assets":
+
+        # Adding a sibling shot/asset is offered from anywhere inside a
+        # section, including task-mode rows and department folders, the same
+        # as from a shot row in the other mode.
+        if section == "assets":
             folder = self.assetFolderForNode(item)
             label = "Add Asset in '%s'" % folder if folder else "Add Asset"
             menu.addAction(label).triggered.connect(
@@ -3678,7 +4149,7 @@ class ProductionTrackerDlg(QDialog):
         # A row that has not been saved yet has no folders on disk, so the
         # shortcuts are shown but inert rather than opening a "does not
         # exist" popup.
-        node = item if item.data(0, ROLE_ROLLUP) else self.rollupAncestor(item)
+        node = item if isRollup else self.rollupAncestor(item)
         pendingRow = bool(item.data(0, ROLE_ISNEW)) or bool(
             node is not None and node.data(0, ROLE_ISNEW)
         )
@@ -3701,9 +4172,9 @@ class ProductionTrackerDlg(QDialog):
             menu.addSeparator()
 
         # --- acting on a row ------------------------------------------------
-        # Only real tracker rows can be renamed or deleted; a task is a Prism
-        # folder and is managed in the Project Browser, not here.
-        if isLeaf and etype in ("shot", "asset"):
+        # Shots and assets can be renamed or deleted in either mode; a task
+        # is a Prism folder and is managed in the Project Browser, not here.
+        if (isLeaf or isRollup) and etype in ("shot", "asset"):
             menu.addAction("Rename").triggered.connect(
                 lambda: self.renameEntity(item)
             )
@@ -4062,27 +4533,21 @@ class ProductionTrackerDlg(QDialog):
         created = 0
         updated = 0
         errors = []
+        self._conflicts = []
 
-        # In task mode a pending shot/asset is a rollup rather than a leaf,
-        # so it has to be collected explicitly or it would never be created.
-        pending = [r for r in self.rollupItems() if r.data(0, ROLE_ISNEW)]
-
-        for item in self.iterLeafItems() + pending:
+        # In task mode a shot/asset is a rollup rather than a leaf, so it has
+        # to be collected explicitly or a new one would never be created and
+        # an edited description/range never written.
+        for item in self.iterLeafItems() + self.rollupItems():
             entity = item.data(0, ROLE_ENTITY)
             isNew = item.data(0, ROLE_ISNEW)
+            isRollup = bool(item.data(0, ROLE_ROLLUP))
 
             # Create the entity in Prism if it is new.
             if isNew:
                 frameRange = None
-                if item.data(0, ROLE_ROLLUP):
-                    # No editable cells on a rollup; the range came from the
-                    # Add Shot dialog and is stored on the entity itself.
-                    if entity.get("_start") is not None:
-                        frameRange = [entity["_start"], entity["_end"]]
-                else:
-                    values = self.getRowValues(item)
-                    if entity.get("type") == "shot":
-                        frameRange = self.parseRange(values["range"])
+                if entity.get("type") == "shot":
+                    frameRange = self.parseRange(self.getRowValues(item)["range"])
                 createEntity = {"type": entity["type"]}
                 if entity["type"] == "shot":
                     createEntity["sequence"] = entity["sequence"]
@@ -4102,12 +4567,11 @@ class ProductionTrackerDlg(QDialog):
                 # The row is now a real entity; persist its fields below.
                 item.setData(0, ROLE_ENTITY, createEntity)
                 item.setData(0, ROLE_ISNEW, False)
-                if item.data(0, ROLE_ROLLUP):
-                    # A rollup has no fields of its own - its tasks carry
-                    # them - so creating it is the whole job.
-                    continue
 
-            ok, errs = self.writeExistingItem(item)
+            if isRollup:
+                ok, errs = self.writeRollupItem(item)
+            else:
+                ok, errs = self.writeExistingItem(item)
             if ok:
                 updated += 1
             errors.extend(errs)
@@ -4126,4 +4590,7 @@ class ProductionTrackerDlg(QDialog):
 
         self.refresh()
         self.refreshPrismUI()
-        self.l_status.setText("Saved. %d created, %d updated." % (created, updated))
+        msg = "Saved. %d created, %d updated." % (created, updated)
+        if self._conflicts:
+            msg += "  " + self.conflictMessage()
+        self.l_status.setText(msg)

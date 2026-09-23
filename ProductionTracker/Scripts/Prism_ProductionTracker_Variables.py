@@ -31,7 +31,7 @@ import os
 # Single source of truth - the Help -> About box reads these too, so the
 # version is only ever written down once.
 PLUGIN_NAME = "Production Tracker"
-PLUGIN_VERSION = "v1.0.0"
+PLUGIN_VERSION = "v1.0.1"
 PLUGIN_URL = "https://github.com/Tronotrond/Prism_ProjectTracker"
 
 
