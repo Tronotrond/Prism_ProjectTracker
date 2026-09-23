@@ -28,10 +28,11 @@
 import os
 
 
-# Single source of truth - the Help -> About box reads these too, so the
-# version is only ever written down once.
+# Single source of truth for the plugin - the Help -> About box reads these
+# too. The README shows the version as well (badge, "Latest version" line and
+# Version history), so update it there when this changes.
 PLUGIN_NAME = "Production Tracker"
-PLUGIN_VERSION = "v1.0.1"
+PLUGIN_VERSION = "v1.0.2"
 PLUGIN_URL = "https://github.com/Tronotrond/Prism_ProjectTracker"
 
 

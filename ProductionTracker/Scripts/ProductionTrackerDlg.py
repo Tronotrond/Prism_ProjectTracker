@@ -38,6 +38,7 @@
 
 
 import os
+import contextlib
 import copy
 import datetime
 import shutil
@@ -390,7 +391,85 @@ class DueDateWidget(QWidget):
 
 # Width reserved for a row's +/trash buttons, so the column headings above
 # the rows line up with the fields rather than drifting across them.
-BULK_BUTTON_W = 30
+BULK_BUTTON_W = 26
+
+GLYPH_COLOR = "#cbd5e1"
+GLYPH_DANGER = "#f87171"
+
+
+def glyphIcon(kind, color=GLYPH_COLOR):
+    """A crisp 'add' or 'trash' icon drawn for the dark theme.
+
+    Drawn rather than taken from the widget style: the style's stock trash
+    icon is a light-theme bitmap that looks out of place in Prism, and a
+    text '+' does not line up with it.
+    """
+    size = 64  # drawn large, shown at 16px, so it stays sharp on HiDPI
+    pm = QPixmap(size, size)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing, True)
+    pen = QPen(QColor(color), 5.5)
+    pen.setCapStyle(Qt.RoundCap)
+    pen.setJoinStyle(Qt.RoundJoin)
+    p.setPen(pen)
+    p.setBrush(Qt.NoBrush)
+    if kind == "add":
+        p.drawLine(QPointF(32, 12), QPointF(32, 52))
+        p.drawLine(QPointF(12, 32), QPointF(52, 32))
+    else:
+        p.drawLine(QPointF(12, 17), QPointF(52, 17))  # lid
+        handle = QPainterPath()
+        handle.moveTo(24, 17)
+        handle.lineTo(26, 10)
+        handle.lineTo(38, 10)
+        handle.lineTo(40, 17)
+        p.drawPath(handle)
+        can = QPainterPath()  # body, slightly tapered
+        can.moveTo(17, 23)
+        can.lineTo(20, 54)
+        can.lineTo(44, 54)
+        can.lineTo(47, 23)
+        p.drawPath(can)
+        for x in (27.5, 36.5):
+            p.drawLine(QPointF(x, 30), QPointF(x, 46))
+    p.end()
+    return QIcon(pm)
+
+
+def makeGlyphButton(kind, toolTip):
+    """A flat square button carrying a glyphIcon, for BulkList rows."""
+    b = QToolButton()
+    b.setIcon(glyphIcon(kind))
+    b.setIconSize(QSize(14, 14))
+    # Same height as the fields beside it, whatever the stylesheet makes
+    # that, rather than a fixed square that pokes out above and below.
+    b.setFixedWidth(BULK_BUTTON_W)
+    b.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Preferred)
+    b.setToolTip(toolTip)
+    b.setCursor(Qt.PointingHandCursor)
+    hover = "rgba(248,113,113,0.18)" if kind == "trash" else "rgba(255,255,255,0.10)"
+    b.setStyleSheet(
+        "QToolButton{border:1px solid rgba(255,255,255,0.10); border-radius:4px;"
+        " background:transparent; padding:0px;}"
+        "QToolButton:hover{background:%s; border-color:rgba(255,255,255,0.22);}"
+        "QToolButton:pressed{background:rgba(255,255,255,0.18);}" % hover
+    )
+    if kind == "trash":
+        # Turn red on hover, so it reads as the destructive one.
+        normal, danger = glyphIcon("trash"), glyphIcon("trash", GLYPH_DANGER)
+
+        class _Hover(QObject):
+            def eventFilter(self, obj, event):
+                if event.type() == QEvent.Enter:
+                    obj.setIcon(danger)
+                elif event.type() == QEvent.Leave:
+                    obj.setIcon(normal)
+                return False
+
+        b._hover = _Hover(b)
+        b.installEventFilter(b._hover)
+    return b
 
 
 class BulkList(QWidget):
@@ -434,17 +513,11 @@ class BulkList(QWidget):
         holder.setLayout(hlo)
         hlo.addWidget(fields, 1)
 
-        b_add = QToolButton()
-        b_add.setText("+")
-        b_add.setFixedWidth(BULK_BUTTON_W)
-        b_add.setToolTip("Add another")
+        b_add = makeGlyphButton("add", "Add another row")
         b_add.clicked.connect(lambda: self.addRow())
         hlo.addWidget(b_add)
 
-        b_remove = QToolButton()
-        b_remove.setIcon(self.style().standardIcon(QStyle.SP_TrashIcon))
-        b_remove.setFixedWidth(BULK_BUTTON_W)
-        b_remove.setToolTip("Remove this row")
+        b_remove = makeGlyphButton("trash", "Remove this row")
         b_remove.clicked.connect(lambda: self.removeRow(holder))
         hlo.addWidget(b_remove)
 
@@ -676,8 +749,9 @@ class BulkDialog(QDialog):
             if width:
                 label.setFixedWidth(width)
             head.addWidget(label, stretch)
-        # Leave room for the +/trash column so nothing sits over it.
-        head.addSpacing(BULK_BUTTON_W * 2 + 8)
+        # Leave room for the +/trash column so nothing sits over it. Each row
+        # shows exactly one of the two buttons, so one button's width.
+        head.addSpacing(BULK_BUTTON_W + 4)
         self._lo.addLayout(head)
 
         self.list = BulkList(self.makeFields)
@@ -895,6 +969,33 @@ class AddTaskDialog(BulkDialog):
         return ""
 
 
+class WorkingDialog(QProgressDialog):
+    """A small 'Working...' window for slow Prism operations.
+
+    Creating departments and tasks runs through Prism - and any plugin hooked
+    into it, such as Prism's USD plugin - on the UI thread, which can take
+    seconds. Without this the tracker stops repainting and Windows draws it
+    as a white, unresponsive window. It is shown straight away and updated
+    between steps, and events are processed at each step so everything keeps
+    repainting.
+    """
+
+    def __init__(self, parent, total):
+        super(WorkingDialog, self).__init__("", "", 0, max(1, total), parent)
+        self.setWindowTitle("Working...")
+        self.setCancelButton(None)
+        self.setWindowModality(Qt.WindowModal)
+        self.setMinimumDuration(0)
+        self.setAutoClose(False)
+        self.setAutoReset(False)
+        self.setMinimumWidth(380)
+
+    def step(self, index, text):
+        self.setLabelText(text)
+        self.setValue(index)
+        QApplication.processEvents()
+
+
 class AboutDialog(QDialog):
     """Help -> About: what this is, which version, and where it lives."""
 
@@ -986,6 +1087,9 @@ class ProductionTrackerDlg(QDialog):
         # Set while a save pushes merged values back into the row widgets,
         # so those programmatic changes don't queue another autosave.
         self._applyingRemote = False
+        # True while a WorkingDialog is up (see working()): live sync and
+        # autosave wait, since the steps process events in between.
+        self._busy = False
         # "label (field)" entries where this user and someone else changed
         # the same field; reported in the status bar after a save.
         self._conflicts = []
@@ -1925,7 +2029,11 @@ class ProductionTrackerDlg(QDialog):
         # Runs in the background; only flags _taskChangesPending.
         self.pollTaskFiles()
         # Don't disturb the user while a dropdown/calendar popup is open.
-        if self._syncing or QApplication.activePopupWidget() is not None:
+        if (
+            self._syncing
+            or self._busy
+            or QApplication.activePopupWidget() is not None
+        ):
             return
         # Don't rebuild while a local edit is still waiting to be auto-saved,
         # otherwise the rebuild would discard the in-progress change.
@@ -2248,7 +2356,7 @@ class ProductionTrackerDlg(QDialog):
     @err_catcher(name=__name__)
     def flushAutoSave(self):
         """Write any changed existing rows. New rows are left for explicit Save."""
-        if self._syncing:
+        if self._syncing or self._busy:
             self.saveTimer.start()  # try again shortly
             return
         try:
@@ -2692,6 +2800,22 @@ class ProductionTrackerDlg(QDialog):
         return (True, errors)
 
     # ------------------------------------------------------------ add task --
+    @contextlib.contextmanager
+    def working(self, total):
+        """Show a WorkingDialog (with a wait cursor) around a slow operation."""
+        dlg = WorkingDialog(self, total)
+        self._busy = True
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            dlg.show()
+            QApplication.processEvents()
+            yield dlg
+        finally:
+            QApplication.restoreOverrideCursor()
+            dlg.close()
+            dlg.deleteLater()
+            self._busy = False
+
     @err_catcher(name=__name__)
     def addTaskTo(self, item, department=""):
         """Create a real Prism department/task under a shot or asset."""
@@ -2707,18 +2831,36 @@ class ProductionTrackerDlg(QDialog):
 
         # Create what we can and report the rest, rather than stopping at the
         # first failure and leaving the batch half done with no explanation.
+        rows = dlg.getRows()
         created = 0
         errors = []
-        for row in dlg.getRows():
-            error = self.tasks.createTask(entity, row["department"], row["task"])
-            if error:
-                errors.append("%s / %s: %s" % (row["department"], row["task"], error))
-            else:
-                created += 1
+        start = time.time()
+        with self.working(len(rows) + 1) as work:
+            for i, row in enumerate(rows):
+                label = "%s / %s" % (
+                    self.tasks.longName(entity, row["department"]),
+                    row["task"],
+                )
+                work.step(i, "Creating %s  (%d of %d)..." % (label, i + 1, len(rows)))
+                error = self.tasks.createTask(entity, row["department"], row["task"])
+                if error:
+                    errors.append("%s: %s" % (label, error))
+                else:
+                    created += 1
+            prismSecs = time.time() - start
+
+            if created:
+                work.step(len(rows), "Updating the tracker...")
+                self.rebuildTaskRows(entity)
+                self.refreshPrismUI()
 
         if created:
-            self.refresh(preserve=self.captureTreeState())
-            self.refreshPrismUI()
+            # Where the time went, so a slow create can be pinned on Prism
+            # (and its plugins) or on the tracker without guesswork.
+            self.l_status.setText(
+                "Created %d task(s) in %.1fs  (Prism: %.1fs, tracker update: %.1fs)"
+                % (created, time.time() - start, prismSecs, time.time() - start - prismSecs)
+            )
         if errors:
             self.core.popup(
                 "Created %d task(s). These failed:\n\n%s"
@@ -2933,6 +3075,14 @@ class ProductionTrackerDlg(QDialog):
             self.refreshRollup(item)
             return item
 
+        self.addDepartmentRows(item, entity)
+        self.refreshRollup(item)
+        item.setExpanded(True)
+        return item
+
+    @err_catcher(name=__name__)
+    def addDepartmentRows(self, item, entity):
+        """The department folders and task rows under a task-mode shot row."""
         # Watched for new departments/tasks. Stat before listing, so anything
         # created in between is noticed rather than missed.
         self.watchPath(self.tasks.departmentsFolder(entity))
@@ -2949,9 +3099,71 @@ class ProductionTrackerDlg(QDialog):
                 self.addTaskItem(deptNode, entity, abbreviation, longName, task)
             deptNode.setExpanded(True)
 
-        self.refreshRollup(item)
-        item.setExpanded(True)
-        return item
+    @err_catcher(name=__name__)
+    def rebuildTaskRows(self, entity):
+        """Re-read one shot/asset's departments and tasks after adding or
+        deleting some, instead of rebuilding the whole tree.
+
+        A full refresh re-reads every shot, asset, thumbnail and task file in
+        the project, so its cost grows with the project; this only touches
+        the one entity that changed. Unsaved edits elsewhere are untouched,
+        and ones in this entity's rows are put back as a refresh would.
+        """
+        key = self.entityKey(entity)
+        rollup = None
+        for item in self.rollupItems():
+            if self.entityKey(item.data(0, ROLE_ENTITY) or {}) == key:
+                rollup = item
+                break
+        if rollup is None:
+            self.refresh(preserve=self.captureTreeState())
+            return
+
+        state = self.captureTreeState()
+        entity = rollup.data(0, ROLE_ENTITY)
+
+        # Forget the old rows' watched paths: a deleted task's file would
+        # otherwise read as "changed by someone else" on the next check.
+        prefix = os.path.normcase(
+            os.path.normpath(self.tasks.departmentsFolder(entity) or "")
+        )
+        if prefix and prefix != ".":
+            for path in list(self._taskWatch):
+                if os.path.normcase(path).startswith(prefix):
+                    del self._taskWatch[path]
+
+        self._building = True
+        try:
+            node = self._notesItem
+            while node is not None:
+                if node is rollup:
+                    self._notesItem = None
+                    break
+                node = node.parent()
+            # Departments stay open unless the user had collapsed them, so a
+            # newly added one shows its task straight away.
+            collapsed = set(
+                rollup.child(i).data(0, ROLE_DEPT)
+                for i in range(rollup.childCount())
+                if not rollup.child(i).isExpanded()
+            )
+            for i in reversed(range(rollup.childCount())):
+                rollup.removeChild(rollup.child(i))
+            self.addDepartmentRows(rollup, entity)
+            self.addTaskAssignees()
+            self.updateNodeCounts()
+            self.restoreTreeState(state)
+            self.refreshRollup(rollup)
+            rollup.setExpanded(True)
+            for i in range(rollup.childCount()):
+                dept = rollup.child(i)
+                dept.setExpanded(dept.data(0, ROLE_DEPT) not in collapsed)
+            self.applyFilter()
+            self.updateStatusLabel()
+            self.updateNotesPanel()
+        finally:
+            self._building = False
+        self.tree.viewport().update()
 
     @err_catcher(name=__name__)
     def deptSwatch(self, departmentLabel):
@@ -4516,7 +4728,7 @@ class ProductionTrackerDlg(QDialog):
             self._notesItem = None
         if not self.removeFolder(folder):
             return
-        self.refresh(preserve=self.captureTreeState())
+        self.rebuildTaskRows(parent)
         self.refreshPrismUI()
         self.l_status.setText("Deleted task '%s / %s'." % (deptLabel, task))
 
@@ -4546,7 +4758,7 @@ class ProductionTrackerDlg(QDialog):
 
         if not self.removeFolder(folder):
             return
-        self.refresh(preserve=self.captureTreeState())
+        self.rebuildTaskRows(entity)
         self.refreshPrismUI()
         self.l_status.setText("Deleted department '%s'." % longName)
 

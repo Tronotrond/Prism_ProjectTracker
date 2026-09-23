@@ -1,5 +1,6 @@
 # Production Tracker
 
+[![Version](https://img.shields.io/badge/version-v1.0.2-22c55e.svg)](#version-history)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 [![Prism Pipeline](https://img.shields.io/badge/Prism%20Pipeline-2.x-6366f1.svg)](https://prism-pipeline.com)
 [![Buy Me A Coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-5F7FFF.svg?logo=buymeacoffee&logoColor=white)](https://www.buymeacoffee.com/tronotrond)
@@ -10,6 +11,9 @@ It adds a spreadsheet-style overview of every shot and asset in a project —
 status, assignee, department, frame range, due date — plus threaded comments
 with to-dos, @mentions and reminder subscriptions. Everything is stored in the
 project itself, so there is no server to run and no database to maintain.
+
+**Latest version: v1.0.2** — see [Version history](#version-history) for what
+changed.
 
 > **Status:** used in production here, but this is a personal project rather
 > than a supported product, and it has only been exercised against the way one
@@ -358,6 +362,40 @@ What has actually been exercised:
 If something breaks, or your project is laid out in a way the tracker gets
 wrong, please open an issue with your Prism version and how the project is
 organised — that is the most useful thing you can send.
+
+---
+
+## Version history
+
+### v1.0.2 (latest)
+
+- **Task mode:** shots and assets with no tasks yet (including new, unsaved
+  ones) no longer disappear from the list, and departments with no tasks are
+  shown so their first task can be added.
+- **Task mode:** right-click to **Delete Task**, or **Delete Department** on
+  an empty department, to undo building out a shot. Folders holding any files
+  are never deleted.
+- Adding tasks shows a **Working...** dialog with progress instead of the
+  window freezing, and only the affected shot is refreshed afterwards. The
+  status bar reports how long it took and how much of that was Prism.
+- Add Task dialog: a wider task name field, and cleaner add/remove row
+  buttons in all the bulk-add dialogs.
+
+### v1.0.1
+
+- **Task mode:** the shot/asset description and frame range are editable on
+  the shot row, and shared with one-task-per-shot mode. Task descriptions stay
+  per task.
+- **Task mode:** Rename and Delete on shot/asset rows; changes by other users
+  are picked up in the background every 30 seconds; assignees found only on
+  tasks appear in the filter and dropdowns.
+- **Safer saving (both modes):** saves merge field by field, so an edit never
+  overwrites someone else's newer change to another field. If two people
+  change the same field, the later save wins and the status bar says so.
+
+### v1.0.0
+
+- First release.
 
 ---
 
