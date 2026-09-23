@@ -2930,9 +2930,9 @@ class ProductionTrackerDlg(QDialog):
         self.watchPath(self.tasks.departmentsFolder(entity))
         for abbreviation, longName in self.tasks.departments(entity):
             self.watchPath(self.tasks.departmentFolder(entity, abbreviation))
+            # Kept even when empty, as the Project Browser does, so the
+            # department can be right-clicked to add its first task.
             taskNames = self.tasks.tasks(entity, abbreviation)
-            if not taskNames:
-                continue
             deptNode = self.makeFolderItem(item, longName)
             deptNode.setData(0, ROLE_ENTITY, None)
             deptNode.setData(0, ROLE_DEPT, (abbreviation, longName))
@@ -3824,14 +3824,15 @@ class ProductionTrackerDlg(QDialog):
                     child.setHidden(not visible)
                     anyVisible = anyVisible or visible
                 elif (
-                    text
-                    and child.data(0, ROLE_ROLLUP)
-                    and text in child.text(COL_NAME).lower()
+                    child.data(0, ROLE_ROLLUP)
+                    and ((not text) or text in child.text(COL_NAME).lower())
                     and mode in (None, "__all__")
                 ):
-                    # In task mode the shot is a folder, so a search for its
-                    # name would otherwise match nothing. Treat it as a hit
-                    # and show everything under it.
+                    # In task mode the shot is a folder, but it is still a
+                    # row of its own: show it when it matches (or nothing is
+                    # being filtered), with everything under it. Otherwise a
+                    # shot with no tasks yet - or a new, unsaved one - would
+                    # count as an empty folder and vanish.
                     showSubtree(child)
                     anyVisible = True
                 else:
