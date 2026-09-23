@@ -597,6 +597,9 @@ class AssetFields(QWidget):
         }
 
 
+TASK_FIELD_MIN_W = 300
+
+
 class TaskFields(QWidget):
     """Department + task name for one row of AddTaskDialog."""
 
@@ -619,7 +622,10 @@ class TaskFields(QWidget):
 
         self.cb_task = QComboBox()
         self.cb_task.setEditable(True)
-        self.cb_task.setMinimumWidth(200)
+        # Task names are free text and often longer than the department
+        # label, so never let the field shrink below a comfortable width.
+        self.cb_task.setMinimumWidth(TASK_FIELD_MIN_W)
+        self.cb_task.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
         wanted = previous.cb_department.currentData() if previous is not None else department
         if wanted:
@@ -837,6 +843,8 @@ class AddTaskDialog(BulkDialog):
             "Press + to queue up more tasks; each new row keeps the "
             "department of the one above it.",
         )
+        # Open with room to spare for the task name, not at the minimum.
+        self.resize(max(self.sizeHint().width(), 680), self.sizeHint().height())
 
     def makeFields(self, previous):
         fields = TaskFields(self.departments, previous, self.department)
@@ -4173,8 +4181,22 @@ class ProductionTrackerDlg(QDialog):
             menu.addSeparator()
 
         # --- acting on a row ------------------------------------------------
-        # Shots and assets can be renamed or deleted in either mode; a task
-        # is a Prism folder and is managed in the Project Browser, not here.
+        # Tasks and departments can be removed again here, so building out a
+        # shot in the wrong place is easy to undo. Like shots/assets, only
+        # while their folder holds no real work (see deleteTask).
+        if etype == "task":
+            menu.addAction("Delete Task").triggered.connect(
+                lambda: self.deleteTask(item)
+            )
+        elif dept:
+            actDelDept = menu.addAction("Delete Department")
+            if item.childCount():
+                actDelDept.setEnabled(False)
+                actDelDept.setToolTip("Delete the tasks in it first.")
+            else:
+                actDelDept.triggered.connect(lambda: self.deleteDepartment(item))
+
+        # Shots and assets can be renamed or deleted in either mode.
         if (isLeaf or isRollup) and etype in ("shot", "asset"):
             menu.addAction("Rename").triggered.connect(
                 lambda: self.renameEntity(item)
@@ -4406,6 +4428,127 @@ class ProductionTrackerDlg(QDialog):
         self.cleanupEntityMetadata(entity)
         self.refresh(preserve=self.captureTreeState())
         self.l_status.setText("Deleted %s '%s'." % (kind, name))
+
+    @err_catcher(name=__name__)
+    def filesIn(self, folder, ignore=()):
+        """Files under `folder` (relative paths), leaving out `ignore`."""
+        ignore = set(os.path.normcase(os.path.normpath(p)) for p in ignore if p)
+        found = []
+        if not folder or not os.path.isdir(folder):
+            return found
+        for root, _dirs, files in os.walk(folder):
+            for name in files:
+                path = os.path.join(root, name)
+                if os.path.normcase(os.path.normpath(path)) not in ignore:
+                    found.append(os.path.relpath(path, folder))
+        return sorted(found)
+
+    @err_catcher(name=__name__)
+    def refuseNonEmpty(self, kind, name, folder, files):
+        """Explain why a folder holding real files was not deleted."""
+        shown = files[:10]
+        more = len(files) - len(shown)
+        self.core.popup(
+            "The %s '%s' was not deleted because its folder contains files:\n\n"
+            "%s%s\n\nTo avoid accidentally deleting work, please review and "
+            "delete it manually if you are sure:\n\n%s"
+            % (
+                kind,
+                name,
+                "\n".join("    " + f for f in shown),
+                "\n    ...and %d more" % more if more > 0 else "",
+                folder,
+            ),
+            parent=self,
+        )
+
+    @err_catcher(name=__name__)
+    def removeFolder(self, folder):
+        """Delete a folder tree. Returns True, or False after telling why."""
+        try:
+            if folder and os.path.exists(folder):
+                shutil.rmtree(folder)
+        except (OSError, PermissionError) as e:
+            self.core.popup(
+                "Could not delete the folder.  It may be in use by another "
+                "program.\n\n%s" % e,
+                parent=self,
+            )
+            return False
+        return True
+
+    @err_catcher(name=__name__)
+    def deleteTask(self, item):
+        """Delete a Prism task folder, e.g. to undo one added by mistake.
+
+        Refused when the folder holds anything besides the task's own info
+        file (which only this tracker writes), so scenefiles and other work
+        are never removed from here.
+        """
+        entity = item.data(0, ROLE_ENTITY) or {}
+        if entity.get("type") != "task":
+            return
+        parent = entity.get("parent") or {}
+        department = entity.get("department", "")
+        task = entity.get("task", "")
+        deptLabel = entity.get("departmentLabel") or department
+
+        folder = self.tasks.taskFolder(parent, department, task)
+        files = self.filesIn(folder, ignore=[self.tasks.dataPath(parent, department, task)])
+        if files:
+            self.refuseNonEmpty("task", task, folder, files)
+            return
+
+        lost = "its status, assignee, due date and description"
+        comments = TrackerComments.active_count(item.data(0, ROLE_NOTES) or {})
+        if comments:
+            lost += ", and %d comment(s)" % comments
+        result = self.core.popupQuestion(
+            "Delete the task '%s' in %s?\n\nThis removes %s, and its folder:\n%s"
+            % (task, deptLabel, lost, folder or "(no folder on disk)"),
+            buttons=["Delete", "Cancel"],
+            parent=self,
+        )
+        if result != "Delete":
+            return
+
+        if item is self._notesItem:
+            self._notesItem = None
+        if not self.removeFolder(folder):
+            return
+        self.refresh(preserve=self.captureTreeState())
+        self.refreshPrismUI()
+        self.l_status.setText("Deleted task '%s / %s'." % (deptLabel, task))
+
+    @err_catcher(name=__name__)
+    def deleteDepartment(self, item):
+        """Delete an empty Prism department folder."""
+        dept = item.data(0, ROLE_DEPT)
+        entity = self.entityForNode(item)
+        if not dept or entity.get("type") not in ("shot", "asset"):
+            return
+        abbreviation, longName = dept
+
+        folder = self.tasks.departmentFolder(entity, abbreviation)
+        files = self.filesIn(folder)
+        if files:
+            self.refuseNonEmpty("department", longName, folder, files)
+            return
+
+        result = self.core.popupQuestion(
+            "Delete the empty department '%s'?\n\nIts folder will be removed:\n%s"
+            % (longName, folder or "(no folder on disk)"),
+            buttons=["Delete", "Cancel"],
+            parent=self,
+        )
+        if result != "Delete":
+            return
+
+        if not self.removeFolder(folder):
+            return
+        self.refresh(preserve=self.captureTreeState())
+        self.refreshPrismUI()
+        self.l_status.setText("Deleted department '%s'." % longName)
 
     @err_catcher(name=__name__)
     def cleanupEntityMetadata(self, entity):

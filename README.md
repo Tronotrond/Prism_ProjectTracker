@@ -178,7 +178,14 @@ This is the mode shown in the screenshot at the top of this page.
 Departments and tasks only exist once something has been created in them, so
 the tracker shows what is really on disk. To add one, right-click a shot or a
 department folder and choose **Add Task…** — it creates a real department/task
-folder through Prism, so the Project Browser sees it too.
+folder through Prism, so the Project Browser sees it too. Departments with no
+tasks yet are listed too, so you can add their first task.
+
+To undo one, right-click it and choose **Delete Task**, or **Delete
+Department** on an empty department. As with deleting a shot, a folder that
+holds any files (scenefiles, renders, anything besides the tracker's own task
+info) is never deleted from here; the tracker lists what it found and leaves
+it to you.
 
 A shot whose tasks are all complete is tinted green, the same way a finished
 row is in the other mode.
