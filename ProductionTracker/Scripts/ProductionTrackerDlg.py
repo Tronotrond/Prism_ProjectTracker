@@ -4571,7 +4571,9 @@ class ProductionTrackerDlg(QDialog):
         """Move an asset's description + tracker metadata to the new name."""
         try:
             path = self.core.configs.getConfigPath(config="assetinfo")
-            data = self.core.getConfig(configPath=path) or {}
+            # The whole file is written back below, so read it fresh: Prism's
+            # cache can predate other users' saves, which this would undo.
+            data = self.core.getConfig(configPath=path, allowCache=False) or {}
             if oldName in data:
                 data[newName] = data.pop(oldName)
             if "assets" in data and oldName in data["assets"]:
@@ -4765,10 +4767,13 @@ class ProductionTrackerDlg(QDialog):
     @err_catcher(name=__name__)
     def cleanupEntityMetadata(self, entity):
         """Remove leftover tracker metadata for a deleted entity."""
+        # Each branch writes the whole info file back, so it is read fresh:
+        # Prism's cache can predate other users' saves to other entities,
+        # which writing a cached copy would revert.
         try:
             if entity.get("type") == "asset":
                 path = self.core.configs.getConfigPath(config="assetinfo")
-                data = self.core.getConfig(configPath=path) or {}
+                data = self.core.getConfig(configPath=path, allowCache=False) or {}
                 name = self.core.entities.getAssetNameFromPath(entity["asset_path"])
                 data.pop(name, None)
                 if "assets" in data:
@@ -4776,7 +4781,7 @@ class ProductionTrackerDlg(QDialog):
                 self.core.setConfig(data=data, configPath=path, updateNestedData=False)
             else:
                 path = self.core.configs.getConfigPath(config="shotinfo")
-                data = self.core.getConfig(configPath=path) or {}
+                data = self.core.getConfig(configPath=path, allowCache=False) or {}
                 seq = entity.get("sequence", "")
                 shot = entity.get("shot", "")
                 episode = entity.get("episode", "")
