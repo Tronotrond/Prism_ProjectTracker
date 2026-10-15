@@ -1,6 +1,6 @@
 # Production Tracker
 
-[![Version](https://img.shields.io/badge/version-v1.0.2-22c55e.svg)](#version-history)
+[![Version](https://img.shields.io/badge/version-v1.0.3-22c55e.svg)](#version-history)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 [![Prism Pipeline](https://img.shields.io/badge/Prism%20Pipeline-2.x-6366f1.svg)](https://prism-pipeline.com)
 [![Buy Me A Coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-5F7FFF.svg?logo=buymeacoffee&logoColor=white)](https://www.buymeacoffee.com/tronotrond)
@@ -12,7 +12,7 @@ status, assignee, department, frame range, due date — plus threaded comments
 with to-dos, @mentions and reminder subscriptions. Everything is stored in the
 project itself, so there is no server to run and no database to maintain.
 
-**Latest version: v1.0.2** — see [Version history](#version-history) for what
+**Latest version: v1.0.3** — see [Version history](#version-history) for what
 changed.
 
 > **Status:** used in production here, but this is a personal project rather
@@ -367,7 +367,15 @@ organised — that is the most useful thing you can send.
 
 ## Version history
 
-### v1.0.2 (latest)
+### v1.0.3 (latest)
+
+- **Fixed:** deleting a shot or asset, or renaming an asset, could put
+  older values back on other shots/assets (status, assignee, department,
+  description) if someone else had saved since the tracker last
+  refreshed. The shared info file is now read fresh from disk before it
+  is written back.
+
+### v1.0.2
 
 - **Task mode:** shots and assets with no tasks yet (including new, unsaved
   ones) no longer disappear from the list, and departments with no tasks are
