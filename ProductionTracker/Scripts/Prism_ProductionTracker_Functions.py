@@ -33,6 +33,8 @@ from qtpy.QtWidgets import *
 
 from PrismUtils.Decorators import err_catcher_plugin as err_catcher
 
+import TrackerPrismGuards
+
 
 class Prism_ProductionTracker_Functions(object):
     def __init__(self, core, plugin):
@@ -45,11 +47,48 @@ class Prism_ProductionTracker_Functions(object):
         self.core.registerCallback(
             "projectBrowser_loadUI", self.projectBrowser_loadUI, plugin=self.plugin
         )
+        # Save and close the tracker while the old project is still current,
+        # so nothing it holds can be written into the next project.
+        self.core.registerCallback(
+            "onPreProjectChange", self.onPreProjectChange, plugin=self.plugin
+        )
+
+        # Stop Prism's own metadata dialogs and asset-description setter from
+        # writing stale copies over tracker data (see TrackerPrismGuards).
+        # Installing is idempotent; it is retried after initialisation in
+        # case part of Prism wasn't ready when this plugin loaded.
+        TrackerPrismGuards.install(self.core, self.plugin)
+        self.core.registerCallback(
+            "postInitialize", self.installGuards, plugin=self.plugin
+        )
 
     # if returns true, the plugin will be loaded by Prism
     @err_catcher(name=__name__)
     def isActive(self):
         return True
+
+    @err_catcher(name=__name__)
+    def installGuards(self, *args):
+        TrackerPrismGuards.install(self.core, self.plugin)
+
+    @err_catcher(name=__name__)
+    def onPreProjectChange(self, *args):
+        """Close the tracker (saving pending edits) before the project
+        changes; it is bound to the project it was opened in."""
+        dlg = self.trackerDlg
+        if dlg and self.core.isObjectValid(dlg):
+            unsaved = dlg.saveBeforeClose() or []
+            if unsaved:
+                self.core.popup(
+                    "Production Tracker could not save these changes before the "
+                    "project changed, so they are lost:  %s" % ", ".join(unsaved[:20])
+                )
+        for attr in ("trackerDlg", "userManagerDlg"):
+            dlg = getattr(self, attr)
+            if dlg and self.core.isObjectValid(dlg):
+                dlg.close()
+                dlg.deleteLater()
+            setattr(self, attr, None)
 
     @err_catcher(name=__name__)
     def projectBrowser_loadUI(self, origin):
@@ -82,7 +121,11 @@ class Prism_ProductionTracker_Functions(object):
         parent = origin or getattr(self.core, "pb", None) or self.core.messageParent
 
         if self.trackerDlg and self.core.isObjectValid(self.trackerDlg):
-            self.trackerDlg.refresh()
+            # An open window is up to date and may hold edits that are still
+            # waiting to autosave, so it is only brought to the front. A
+            # closed one is re-read, keeping any edit it couldn't save.
+            if not self.trackerDlg.isVisible():
+                self.trackerDlg.reloadForShow()
             self.trackerDlg.show()
             self.trackerDlg.raise_()
             self.trackerDlg.activateWindow()

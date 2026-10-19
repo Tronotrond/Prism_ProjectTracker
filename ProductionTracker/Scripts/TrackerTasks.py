@@ -194,13 +194,30 @@ class TrackerTasks(object):
             data = None
         return data if isinstance(data, dict) else {}
 
-    @err_catcher(name=__name__)
+    # readFresh() and write() raise on failure, so they are deliberately not
+    # wrapped in err_catcher: it would swallow the error and a failed read or
+    # write would look like a successful one.
+    def readFresh(self, entity, department, task):
+        """Everything stored for a task, read from disk rather than from
+        Prism's cache ({} when the file does not exist). Raises if the file
+        exists but can't be read, so that is never taken for "nothing
+        stored" when saving."""
+        path = self.dataPath(entity, department, task)
+        if not path or not os.path.exists(path):
+            return {}
+        data = self.core.getConfig(configPath=path, allowCache=False)
+        if not isinstance(data, dict):
+            raise RuntimeError("could not read %s" % path)
+        return data
+
     def write(self, entity, department, task, values):
         """Merge `values` into the task's info file.
 
         Read-modify-write against the file as it is right now, so keys written
         by Prism (or by another artist since this window opened) survive, and
-        only the fields handed in here are touched.
+        only the fields handed in here are touched. Prism drops a write it
+        can't lock the file for without raising, so the result is read back
+        and an error raised if it didn't land.
         """
         path = self.dataPath(entity, department, task)
         if not path:
@@ -210,20 +227,18 @@ class TrackerTasks(object):
         if folder and not os.path.exists(folder):
             os.makedirs(folder)
 
-        try:
-            self.core.configs.clearCache(path)
-        except Exception:
-            pass
-
-        current = {}
-        if os.path.exists(path):
-            try:
-                loaded = self.core.getConfig(configPath=path)
-                if isinstance(loaded, dict):
-                    current = loaded
-            except Exception:
-                current = {}
-
+        current = self.readFresh(entity, department, task)
         current.update(values or {})
         self.core.setConfig(data=current, configPath=path, updateNestedData=False)
+
+        written = self.readFresh(entity, department, task)
+        if any(written.get(key) != value for key, value in (values or {}).items()):
+            try:
+                self.core.configs.clearCache(path)
+            except Exception:
+                pass
+            raise RuntimeError(
+                "the change did not reach %s (is the file in use?); it will be "
+                "retried" % os.path.basename(path)
+            )
         return current

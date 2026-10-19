@@ -32,7 +32,7 @@ import os
 # too. The README shows the version as well (badge, "Latest version" line and
 # Version history), so update it there when this changes.
 PLUGIN_NAME = "Production Tracker"
-PLUGIN_VERSION = "v1.0.3"
+PLUGIN_VERSION = "v1.0.4"
 PLUGIN_URL = "https://github.com/Tronotrond/Prism_ProjectTracker"
 
 

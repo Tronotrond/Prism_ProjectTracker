@@ -1,6 +1,6 @@
 # Production Tracker
 
-[![Version](https://img.shields.io/badge/version-v1.0.3-22c55e.svg)](#version-history)
+[![Version](https://img.shields.io/badge/version-v1.0.4-22c55e.svg)](#version-history)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 [![Prism Pipeline](https://img.shields.io/badge/Prism%20Pipeline-2.x-6366f1.svg)](https://prism-pipeline.com)
 [![Buy Me A Coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-5F7FFF.svg?logo=buymeacoffee&logoColor=white)](https://www.buymeacoffee.com/tronotrond)
@@ -12,7 +12,7 @@ status, assignee, department, frame range, due date — plus threaded comments
 with to-dos, @mentions and reminder subscriptions. Everything is stored in the
 project itself, so there is no server to run and no database to maintain.
 
-**Latest version: v1.0.3** — see [Version history](#version-history) for what
+**Latest version: v1.0.4** — see [Version history](#version-history) for what
 changed.
 
 > **Status:** used in production here, but this is a personal project rather
@@ -269,7 +269,7 @@ project and be visible to everyone.
 | `<pipeline>/Configs/ProductionTracker.json` | the plugin | Its own file: mode, roster, notification settings, departments. |
 | `<pipeline>/Configs/ProductionTracker_NotifyLog.json` | the plugin | Its own file: the notification send log. |
 | `<pipeline>/Shotinfo/shotInfo.*` | **Prism** | Adds `tracker_*` keys inside each shot's `metadata` block. Frame ranges go through Prism's own `setShotRange`. |
-| `<pipeline>/Assetinfo/assetInfo.*` | **Prism** | Adds `tracker_*` keys inside each asset's `metadata` block. Descriptions go through Prism's own `setAssetDescription`. |
+| `<pipeline>/Assetinfo/assetInfo.*` | **Prism** | Adds `tracker_*` keys inside each asset's `metadata` block, and writes the asset's `description` (Prism's own field). |
 | `<task folder>/info.*` | **Prism** | Task-mode only: adds `tracker_*` keys for that task. |
 | `Documents/Prism2/Prism.json` | **Prism (per user)** | One namespaced `productiontracker` section: the row-colour preference and which comments you have read. Per user, never per project. |
 
@@ -279,10 +279,21 @@ The project config (`pipeline.json`) is **never** written.
 
 - Every key the tracker adds is prefixed `tracker_`, so it cannot collide with
   Prism's own fields or with metadata anyone adds by hand.
-- Prism's `setMetaData` replaces an entity's whole `metadata` block, so the
-  tracker always re-reads that block and adds to it. Keys put there by Prism
-  or by another tool survive. Prism re-reads the file before writing, so other
-  entities are never affected.
+- An entity's `metadata` block is written as a whole, so the tracker re-reads
+  the file from disk (not from Prism's cache) right before each write and
+  only changes that one entity's block. Keys put there by Prism or by another
+  tool survive, and other entities are never affected. Each write is read
+  back to check it reached the disk; if Prism couldn't write the file (it
+  was locked, say), the row stays unsaved and the save is retried.
+- Prism's own metadata dialogs (Edit Shot, the asset description dialog)
+  rewrite the whole block too, from what they read when they opened. In any
+  Prism window that loads this plugin they are guarded: saving one only
+  applies the rows you changed in it, so it can't put back an older status or
+  description, or turn comments into plain text. The same goes for the asset
+  description box, Prism's asset description setter and Prism's shot,
+  sequence and episode renames, which all wrote from Prism's cache. Prism
+  windows that don't load the plugin (a different Prism install, say) are
+  not guarded.
 - Comment threads **merge** rather than overwrite, so two people commenting on
   the same entity at once do not clobber each other.
 - Other fields merge **field by field**: a save only writes what you changed,
@@ -315,7 +326,8 @@ The project config (`pipeline.json`) is **never** written.
   every few seconds. Task mode keeps each task in its own file, so it checks
   those files' timestamps in the background every 30 seconds; press Refresh
   to see changes sooner. Saving does not depend on this, since every save
-  merges against the files as they are at that moment.
+  merges against the files as they are at that moment. When a refresh or
+  save finds that values changed elsewhere, the status bar lists them.
 
 ### Known Prism behaviour to be aware of
 
@@ -367,7 +379,72 @@ organised — that is the most useful thing you can send.
 
 ## Version history
 
-### v1.0.3 (latest)
+### v1.0.4 (latest)
+
+Fixes for statuses and descriptions that sometimes went back to an older
+value (for example Completed back to In-progress) while Prism and the
+tracker were both open.
+
+- **Fixed:** Prism's own **Edit Shot** and asset description dialogs save the
+  whole metadata block they read when they opened, so one left open while
+  the tracker saved put the old status, department and description back. It
+  also turned comments and FX layers into plain text. The plugin now guards
+  those dialogs in every Prism window that loads it: their save only applies
+  the rows you actually changed in the dialog, and everything else keeps its
+  current value. FX layers already saved as text are read back.
+- **Fixed:** Prism's `setAssetDescription` wrote a cached copy of the whole
+  asset info file, which could put old values back on other assets. The
+  plugin now writes just that one description against the file on disk.
+  Prism's asset Edit dialog also opens with the description on disk, and
+  only writes it back if you changed it.
+- **Fixed:** renaming a shot, sequence or episode in Prism rewrote other
+  shots' data from Prism's cache. The cache is now cleared first.
+- **Fixed:** a save that Prism silently dropped (the info file was locked or
+  couldn't be written) showed as saved, and the old value came back later.
+  Every save is now read back from disk. If it didn't land, the row stays
+  unsaved, the status bar says so, and it is retried a few times (and again
+  with your next change, on Save, or when the tracker is reopened).
+  Mention and reminder emails are sent only once the save has landed, so a
+  retry never emails twice.
+- **Fixed:** saves now read the info file directly instead of through
+  Prism's cache, and never modify the cached copy. An unreadable info file
+  stops the save instead of being treated as empty.
+- **Fixed:** live sync stopped for good once the tracker was closed and
+  reopened, and paused whenever a drop-down in the grid had focus. Changes
+  made elsewhere could then stay hidden until the next Save, which made it
+  look as if Save had changed them. Live sync now restarts when the window
+  is shown and only waits while you are typing. It also no longer skips a
+  change that lands right after an autosave.
+- **New:** the status bar names any values that were changed outside the
+  tracker since it last read them, e.g. "SH010: status Completed ->
+  In-progress", whether a refresh or one of your saves brought them in, so a
+  change from another window or user is easy to tell apart from your own.
+- **Fixed:** a stray key press on a Status or Department drop-down that still
+  had focus changed its value ("i" picks In-progress). Keys now only open
+  the list.
+- **Fixed:** Refresh, or Open Tracker on an already open window, within a
+  second or two of an edit discarded that edit. Save no longer drops edits
+  whose write failed, or new shots/assets Prism could not create (including
+  ones that already exist as omitted and weren't restored). Renaming a row
+  keeps the unsaved edits on it and on its tasks, also when Prism cancels
+  the rename because a file is in use.
+- **Fixed:** a stored status that isn't spelled exactly like the tracker's
+  (e.g. "completed") or a due date it can't show was saved back as "Not
+  started" / no date the next time any row was saved.
+- **Fixed:** a comment being written or edited in the side panel was cleared
+  by Save, autosave or live sync.
+- **Fixed:** saving in User Management switched a task-mode project back to
+  one-task-per-shot mode.
+- **Fixed:** the tracker now saves and closes when Prism switches project,
+  instead of writing pending edits into the new one.
+- **Fixed:** renaming a shot could put old values back on other shots (Prism
+  renames from its cache; it is now cleared first), and renaming an unsaved
+  new row did nothing.
+- **Fixed:** an old plain-text note was duplicated the first time its
+  entity was saved, and a project department named "Complete" was renamed
+  to "Approved".
+
+### v1.0.3
 
 - **Fixed:** deleting a shot or asset, or renaming an asset, could put
   older values back on other shots/assets (status, assignee, department,

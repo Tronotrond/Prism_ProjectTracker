@@ -58,6 +58,7 @@
 
 
 import ast
+import hashlib
 import json
 import re
 import time
@@ -240,11 +241,13 @@ def load_notes_value(raw):
         if recovered is not None:
             return recovered
         # Legacy plain-text note -> becomes the first comment, authored
-        # "legacy" so it's obvious it predates the comment system.
+        # "legacy" so it's obvious it predates the comment system. Its id is
+        # derived from the text, so every load gives the same id; a random
+        # one made the merge on save see a "new" comment and duplicate it.
         return {
             "comments": [
                 {
-                    "id": new_id(),
+                    "id": "legacy-" + hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16],
                     "author": "legacy",
                     "text": raw,
                     "created": 0,

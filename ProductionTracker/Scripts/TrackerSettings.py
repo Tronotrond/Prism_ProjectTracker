@@ -317,7 +317,10 @@ class TrackerSettings(object):
 
     @err_catcher(name=__name__)
     def saveSettings(self, settings):
-        merged = dict(DEFAULT_SETTINGS)
+        # Start from what is stored, not from the defaults: a caller that
+        # only edits some settings (User Management doesn't know about the
+        # tracker mode) must not reset the rest.
+        merged = self.getSettings() or dict(DEFAULT_SETTINGS)
         merged.update(settings or {})
         self.ensureConfigFolder()
         self.core.configs.setConfig(

@@ -610,6 +610,9 @@ class CommentCard(QFrame):
             tag.setWordWrap(True)
             self.bodyLo.addWidget(tag)
 
+    def isEditing(self):
+        return self._editWidget is not None
+
     def _enterEditMode(self):
         self._clearBody()
         self._editWidget = MentionEdit()
@@ -833,9 +836,41 @@ class CommentsPanel(QWidget):
     @err_catcher(name=__name__)
     def refreshData(self, notesData):
         """Update the rendered thread (e.g. after an autosave merge) without
-        disturbing anything the user is currently typing in the compose box."""
-        self._data = copy.deepcopy(notesData) if notesData else TrackerComments.empty_data()
+        disturbing anything the user is currently typing in the compose box,
+        or in a comment being edited."""
+        data = copy.deepcopy(notesData) if notesData else TrackerComments.empty_data()
+        if data == self._data:
+            return
+        oldCards = self.findChildren(CommentCard)
+        editing = dict(
+            (card.commentId, card._editWidget.toPlainText())
+            for card in oldCards
+            if card.isEditing()
+        )
+        self._data = data
         self._rebuildCards()
+        if editing:
+            # The old cards are only deleted later, so tell the new ones apart.
+            for card in self.findChildren(CommentCard):
+                if card not in oldCards and card.commentId in editing:
+                    card._enterEditMode()
+                    card._editWidget.setPlainText(editing[card.commentId])
+
+    @err_catcher(name=__name__)
+    def refreshEntity(self, label, notesData):
+        """Show the same entity again after the tracker rebuilt its row (a
+        save or a sync): like setEntity, but a half-written comment or reply
+        stays in the compose box."""
+        self._enabled = True
+        self.l_target.setText(label)
+        self.refreshData(notesData)
+
+    @err_catcher(name=__name__)
+    def isEditingComment(self):
+        """True while an existing comment is being edited in place. (A new
+        comment or reply being written survives a rebuild of the same row;
+        see refreshEntity.)"""
+        return any(card.isEditing() for card in self.findChildren(CommentCard))
 
     @err_catcher(name=__name__)
     def getData(self):
