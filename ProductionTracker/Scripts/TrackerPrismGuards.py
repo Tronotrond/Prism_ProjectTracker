@@ -50,6 +50,22 @@
 #    whole sections of the shot info file from Prism's cache. Guarded, the
 #    cache is cleared first so they work from the file as it is now.
 #
+# 5. The Edit Shot dialog's frame range. It is filled when the dialog opens
+#    (from Prism's cache) and written back on Save whether or not it was
+#    edited. Guarded, it opens with the range on disk and is only written
+#    if changed.
+#
+# 6. entities.setShotRange. When the shot info file can't be read, Prism
+#    treats it as empty and writes a file holding just this one range,
+#    losing every shot's tracker data. Guarded, nothing is written then.
+#
+# 7. entities.createShot / createAsset on a shot or asset that already
+#    exists (a name typed in a Create dialog that someone created
+#    meanwhile). Prism writes the dialog's frame range over the stored one
+#    and replaces the whole metadata block with the dialog's rows, wiping
+#    the tracker's fields. Guarded, a stored range is kept and the rows are
+#    added to the stored metadata.
+#
 ####################################################
 
 
@@ -74,6 +90,9 @@ def install(core, plugin=None):
         guardSetAssetDescription,
         guardAssetDialog,
         guardShotRenames,
+        guardEditShot,
+        guardCreateEntities,
+        guardSetShotRange,
     ):
         try:
             guard(core, plugin)
@@ -160,6 +179,21 @@ def plainText(text):
         return doc.toPlainText()
     except Exception:
         return text or ""
+
+
+def patchEntities(core, plugin, orig, new):
+    """Replace a core.entities function through Prism's monkeyPatch, and say
+    so if it didn't take: Prism skips a function another plugin has already
+    patched, and quiet=True keeps that from popping up."""
+    name = orig.__name__
+    setattr(new, GUARD_ATTR, True)
+    new.__name__ = name
+    core.plugins.monkeyPatch(orig, new, plugin, quiet=True)
+    if getattr(core.entities, name, None) is not new:
+        logger.warning(
+            "Production Tracker: %s is already patched by another plugin, so the "
+            "tracker's guard for it is not installed", name
+        )
 
 
 def popup(core, text):
@@ -260,8 +294,7 @@ def guardSetAssetDescription(core, plugin=None):
         entry["description"] = description
         core.setConfig(data=data, configPath=assetFile, updateNestedData=False)
 
-    setattr(setAssetDescription, GUARD_ATTR, True)
-    core.plugins.monkeyPatch(orig, setAssetDescription, plugin, quiet=True)
+    patchEntities(core, plugin, orig, setAssetDescription)
 
 
 def guardAssetDialog(core, plugin=None):
@@ -331,8 +364,178 @@ def guardShotRenames(core, plugin=None):
                     pass
                 return _orig(*args, **kwargs)
 
-            wrapper.__name__ = name
-            setattr(wrapper, GUARD_ATTR, True)
-            core.plugins.monkeyPatch(orig, wrapper, plugin, quiet=True)
+            patchEntities(core, plugin, orig, wrapper)
         except Exception as e:
             logger.warning("Production Tracker: could not guard %s: %s", name, e)
+
+
+# ----------------------------------------------------- Edit Shot range ----
+def guardEditShot(core, plugin=None):
+    """Prism's Edit Shot dialog: open it with the frame range on disk, and
+    only write the range back if it was changed in the dialog."""
+    import EditShot
+
+    cls = EditShot.EditShot
+    if getattr(cls, GUARD_ATTR, False):
+        return
+    origLoad = cls.loadData
+    origSave = cls.saveInfo
+
+    def loadData(self, *args, **kwargs):
+        editing = bool((getattr(self, "shotData", None) or {}).get("shot"))
+        if editing:
+            try:
+                self.core.configs.clearCache(
+                    path=self.core.configs.getConfigPath(config="shotinfo")
+                )
+            except Exception:
+                pass
+        result = origLoad(self, *args, **kwargs)
+        shown = None
+        try:
+            stored = self.core.entities.getShotRange(self.shotData) if editing else None
+            if stored and stored[0] is not None:
+                shown = (self.sp_startFrame.value(), self.sp_endFrame.value())
+        except Exception:
+            pass
+        # The range as the dialog showed it, or None when the shot had none
+        # (then Prism's default is written as before).
+        self._trackerShownRange = shown
+        self._trackerEditing = editing
+        # What the range boxes held when the dialog opened, whatever the
+        # reason (Prism's default when the file couldn't be read, say).
+        self._trackerOpenRange = (
+            (self.sp_startFrame.value(), self.sp_endFrame.value()) if editing else None
+        )
+        return result
+
+    def saveInfo(self, *args, **kwargs):
+        shown = getattr(self, "_trackerShownRange", None)
+        entities = self.core.entities
+        origSet = entities.setShotRange
+        # Whether setShotRange is already replaced on the instance (by
+        # another plugin), so that is what gets put back afterwards.
+        hadOwn = "setShotRange" in vars(entities)
+
+        editing = getattr(self, "_trackerEditing", True)
+        opened = getattr(self, "_trackerOpenRange", None)
+
+        def setShotRange(entity, start, end):
+            if shown is not None and (start, end) == shown:
+                # Not changed in the dialog: keep what is stored now, which
+                # may be newer than what the dialog showed.
+                return None
+            if editing and shown is None and (start, end) == opened and storedRange(core, entity):
+                # Untouched, but a range is stored now (the file couldn't be
+                # read when the dialog opened, or one was set elsewhere since).
+                return None
+            if not editing and storedRange(core, entity):
+                # Create mode ("Next") on a shot that exists already: keep its
+                # range, as creating it does (see guardCreateEntities).
+                return None
+            return origSet(entity, start, end)
+
+        entities.setShotRange = setShotRange
+        try:
+            return origSave(self, *args, **kwargs)
+        finally:
+            if entities.setShotRange is setShotRange:
+                if hadOwn:
+                    entities.setShotRange = origSet
+                else:
+                    del entities.setShotRange
+
+    cls.loadData = loadData
+    cls.saveInfo = saveInfo
+    setattr(cls, GUARD_ATTR, True)
+
+
+def storedRange(core, entity):
+    """The frame range stored for a shot, read fresh, or None."""
+    try:
+        core.configs.clearCache(path=core.configs.getConfigPath(config="shotinfo"))
+        stored = core.entities.getShotRange(entity)
+    except Exception:
+        return None
+    return stored if stored and stored[0] is not None else None
+
+
+# ------------------------------------------------------- shot ranges ------
+def guardSetShotRange(core, plugin=None):
+    entities = core.entities
+    orig = entities.setShotRange
+    if getattr(orig, GUARD_ATTR, False):
+        return
+
+    def setShotRange(entity, start, end):
+        path = core.configs.getConfigPath(config="shotinfo")
+        if readFreshFile(core, path) is None:
+            # Prism would read the unreadable file as empty and write one
+            # holding just this range.
+            popup(
+                core,
+                "The frame range of '%s' was not saved: the shot info file "
+                "could not be read. Please try again." % (entity or {}).get("shot", ""),
+            )
+            return None
+        return orig(entity, start, end)
+
+    patchEntities(core, plugin, orig, setShotRange)
+
+
+# --------------------------------------------- creating existing entities --
+def guardCreateEntities(core, plugin=None):
+    entities = core.entities
+
+    def existingMetaData(entity, metaData):
+        """The dialog's metadata rows added to what an existing entity has
+        stored, or None when that can't be read (then none are written)."""
+        try:
+            stored = readFreshMetaData(core, entity)
+        except Exception:
+            stored = None
+        if stored is None:
+            logger.warning(
+                "Production Tracker: the metadata of an existing entity could not "
+                "be read, so the new rows were not added to it"
+            )
+            return None
+        stored.update(metaData)
+        return stored
+
+    origShot = entities.createShot
+    if not getattr(origShot, GUARD_ATTR, False):
+
+        def createShot(entity, frameRange=None, preview=None, metaData=None):
+            try:
+                existed = os.path.exists(core.getEntityPath(entity=entity) or "")
+            except Exception:
+                existed = False
+            if existed:
+                if frameRange and storedRange(core, entity):
+                    frameRange = None
+                if metaData:
+                    metaData = existingMetaData(dict(entity, type="shot"), metaData)
+            return origShot(entity, frameRange=frameRange, preview=preview, metaData=metaData)
+
+        patchEntities(core, plugin, origShot, createShot)
+
+    origAsset = entities.createAsset
+    if not getattr(origAsset, GUARD_ATTR, False):
+
+        def createAsset(entity, description=None, preview=None, metaData=None, dialog=None):
+            if metaData:
+                try:
+                    existed = os.path.exists(
+                        os.path.join(core.assetPath, entity.get("asset_path", ""))
+                    )
+                except Exception:
+                    existed = False
+                if existed:
+                    metaData = existingMetaData(dict(entity, type="asset"), metaData)
+            return origAsset(
+                entity, description=description, preview=preview,
+                metaData=metaData, dialog=dialog,
+            )
+
+        patchEntities(core, plugin, origAsset, createAsset)

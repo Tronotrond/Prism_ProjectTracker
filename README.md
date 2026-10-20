@@ -1,6 +1,6 @@
 # Production Tracker
 
-[![Version](https://img.shields.io/badge/version-v1.0.4-22c55e.svg)](#version-history)
+[![Version](https://img.shields.io/badge/version-v1.1.0-22c55e.svg)](#version-history)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 [![Prism Pipeline](https://img.shields.io/badge/Prism%20Pipeline-2.x-6366f1.svg)](https://prism-pipeline.com)
 [![Buy Me A Coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-5F7FFF.svg?logo=buymeacoffee&logoColor=white)](https://www.buymeacoffee.com/tronotrond)
@@ -12,7 +12,7 @@ status, assignee, department, frame range, due date — plus threaded comments
 with to-dos, @mentions and reminder subscriptions. Everything is stored in the
 project itself, so there is no server to run and no database to maintain.
 
-**Latest version: v1.0.4** — see [Version history](#version-history) for what
+**Latest version: v1.1.0** — see [Version history](#version-history) for what
 changed.
 
 > **Status:** used in production here, but this is a personal project rather
@@ -40,6 +40,9 @@ changed.
 - **Two modes** (Configuration → Settings): one row per shot, or one row per
   Prism **department and task**, matching the Project Browser's Scenefiles
   tab. See [Tracker modes](#tracker-modes).
+- Works with Prism's **Project Management** plugin: when a project uses it,
+  task statuses are Prism's own, the same ones the Project Browser shows.
+  See [Task statuses with Prism's Project Management](#task-statuses-with-prisms-project-management).
 - Every shot and asset in one tree, organised the way Prism organises them
   (sequences containing shots, nested folders containing assets).
 - Per-entity **status**, **assignee**, **department**, **frame range**,
@@ -204,6 +207,61 @@ it to you.
 A shot whose tasks are all complete is tinted green, the same way a finished
 row is in the other mode.
 
+### Task statuses with Prism's Project Management
+
+Prism's **Project Management** plugin can give every task a status of its
+own, shown in the Project Browser. It is switched on per project, by setting
+a **Manager** under Project Settings → Project Management (`Prism`, or
+Kitsu, ShotGrid or ftrack).
+
+When a project has a manager set, the tracker's task rows show and edit
+**that** status instead of keeping their own, so the tracker and the Project
+Browser always show the same one. The Status dropdown offers the project's
+own task statuses, with their colours, and a task that has no status yet
+shows *No status*. Projects without a manager, and the one-task-per-shot
+mode (Prism has no shot or asset status), work exactly as before.
+
+- **Which statuses count as done.** The project's statuses are its own, so
+  Configuration → Settings lists them and lets you tick which ones count as
+  **done** (the row turns green and counts towards the shot's "complete"
+  total) and which mean **not needed** (the row fades). By default this goes
+  by name: *Finished*, *Completed*, *Approved* and similar count as done;
+  *Not Needed*, *Omit* and similar fade.
+- **Machines without the plugin.** What decides it is the project's
+  setting, not whether the plugin is installed, so everyone edits the same
+  status. With the `Prism` manager the status is just a field in the task's
+  `info` file, so the tracker reads and writes it itself where the plugin
+  isn't installed. Kitsu, ShotGrid and ftrack keep statuses on their server,
+  which only the plugin can reach: without it the tracker shows the column
+  read-only and says so.
+- **Turning a manager on in a running project.** Nothing is overwritten.
+  The tracker's own task statuses stay in the files, and the first person
+  to open the tracker afterwards is offered to copy them across. Only tasks
+  with no Prism status yet get one; where a task already has a different
+  Prism status, Prism's is kept and the task is listed so you can check it.
+  The tracker's *In-review* and *Not needed* have no match in Prism's
+  default list, so it offers to add *In Review* and *Not Needed* to the
+  project's task statuses. Other Prism sessions that were already open
+  keep showing tasks with a newly added status as **?** until they are
+  restarted (Prism's plugin remembers the icon it drew for an unknown
+  status); the session the tracker added it in updates right away.
+- **Turning it off again.** The tracker shows its own statuses again, as
+  they were before, and offers to copy Prism's statuses back into them.
+- **Configuration → Copy Task Statuses** does either copy by hand at any
+  time.
+
+Everyone working on the project needs **v1.1.0 or later**: an older tracker
+only knows its own statuses, so it would keep editing those while everyone
+else edits Prism's.
+
+A status set in the Project Browser of the same Prism session shows up in
+the tracker straight away; one set on another machine the next time the
+tracker checks the task files (every 30 seconds) or on Refresh. Statuses kept
+on a Kitsu, ShotGrid or ftrack server change no file, so other machines'
+changes to them are re-read when the tracker refreshes. The other way round,
+each save in the tracker updates the Project Browser's task list and shot
+info.
+
 ### Switching modes
 
 The two modes store their data in different places, so switching is lossless
@@ -254,6 +312,7 @@ which keeps a handed-over project readable.
 | --- | --- |
 | Status, assignee, department, dates, comments (shot mode) | Prism's per-entity metadata (`Shotinfo` / `Assetinfo`) |
 | The same fields per task (task mode) | `<task folder>/info.json` |
+| Task status, when the project uses Prism's Project Management | Prism's own `status` field in `<task folder>/info.json` (the status's abbreviation, e.g. `fin`, as Prism writes it), or the Kitsu/ShotGrid/ftrack server |
 | Roster, notification settings, departments | `<pipeline>/Configs/ProductionTracker.json` |
 | Notification send log | `<pipeline>/Configs/ProductionTracker_NotifyLog.json` |
 | "Colour rows by user" preference | Your Prism user config (per user, not per project) |
@@ -276,14 +335,17 @@ project and be visible to everyone.
 
 | File | Owner | What the tracker does |
 | --- | --- | --- |
-| `<pipeline>/Configs/ProductionTracker.json` | the plugin | Its own file: mode, roster, notification settings, departments. |
+| `<pipeline>/Configs/ProductionTracker.json` | the plugin | Its own file: mode, roster, notification settings, departments, which Prism task statuses count as done. |
 | `<pipeline>/Configs/ProductionTracker_NotifyLog.json` | the plugin | Its own file: the notification send log. |
 | `<pipeline>/Shotinfo/shotInfo.*` | **Prism** | Adds `tracker_*` keys inside each shot's `metadata` block. Frame ranges go through Prism's own `setShotRange`. |
 | `<pipeline>/Assetinfo/assetInfo.*` | **Prism** | Adds `tracker_*` keys inside each asset's `metadata` block, and writes the asset's `description` (Prism's own field). |
-| `<task folder>/info.*` | **Prism** | Task-mode only: adds `tracker_*` keys for that task. |
+| `<task folder>/info.*` | **Prism** | Task-mode only: adds `tracker_*` keys for that task. When the project uses Prism's Project Management with the `Prism` manager, also sets the task's `status`, through that plugin where it is installed. |
 | `Documents/Prism2/Prism.json` | **Prism (per user)** | One namespaced `productiontracker` section: the row-colour preference and which comments you have read. Per user, never per project. |
 
-The project config (`pipeline.json`) is **never** written.
+The project config (`pipeline.json`) is only written in one case: when you
+choose to add the tracker's *In Review* / *Not Needed* to the project's task
+statuses while copying statuses into Prism (see
+[Task statuses with Prism's Project Management](#task-statuses-with-prisms-project-management)).
 
 ### How the shared files are kept safe
 
@@ -301,9 +363,13 @@ The project config (`pipeline.json`) is **never** written.
   applies the rows you changed in it, so it can't put back an older status or
   description, or turn comments into plain text. The same goes for the asset
   description box, Prism's asset description setter and Prism's shot,
-  sequence and episode renames, which all wrote from Prism's cache. Prism
-  windows that don't load the plugin (a different Prism install, say) are
-  not guarded.
+  sequence and episode renames, which all wrote from Prism's cache. Edit
+  Shot's frame range is only written back if you changed it, and creating a
+  shot or asset that already exists keeps its stored frame range and
+  tracker fields. Prism windows that don't load the plugin (a different
+  Prism install, say) are not guarded.
+- A task deleted or renamed in Prism is never brought back by a tracker
+  save that was still pending for it: the save stops and says why.
 - Comment threads **merge** rather than overwrite, so two people commenting on
   the same entity at once do not clobber each other.
 - Other fields merge **field by field**: a save only writes what you changed,
@@ -389,7 +455,90 @@ organised — that is the most useful thing you can send.
 
 ## Version history
 
-### v1.0.4 (latest)
+### v1.1.0 (latest)
+
+Works together with Prism's own **Project Management** plugin.
+
+- **New:** in *Prism departments and tasks* mode, a project that has a
+  Project Management **Manager** set (Project Settings → Project Management)
+  now uses Prism's task statuses. The tracker shows and edits the same
+  status as the Project Browser, from the project's own list of statuses,
+  instead of keeping a separate one that never matched. Statuses are saved
+  the way Prism saves them (by abbreviation, e.g. `fin`), so the Project
+  Browser shows each one with its proper icon. Projects without a
+  manager, and the one-task-per-shot mode, work as before. See
+  [Task statuses with Prism's Project Management](#task-statuses-with-prisms-project-management).
+- **New:** Configuration → Settings lists the project's Prism task statuses
+  and lets you choose which count as done and which as not needed.
+- **New:** when a project starts or stops using a manager, the tracker
+  offers once to copy task statuses across, and Configuration → Copy Task
+  Statuses does it by hand. Copying into Prism only fills in tasks that have
+  no Prism status yet; nothing is deleted.
+- **New:** with the `Prism` manager the status is read and written even on
+  machines without the Project Management plugin, so a mixed team still
+  edits one status. Kitsu, ShotGrid and ftrack statuses need the plugin and
+  are shown read-only without it.
+- **New:** the tracker and an open Project Browser keep each other up to
+  date. Every save in the tracker, autosaves included, updates the Project
+  Browser's task list and the selected shot's or asset's info, without
+  rebuilding the whole browser. Shots, assets, departments and tasks created
+  in the Project Browser, statuses set there, Edit Shot saves and Project
+  Settings changes show up in the tracker straight away instead of at its
+  next check. Changes from other machines still arrive by the tracker's
+  regular checks.
+- **New:** the tracker window shows its version next to its title.
+- **Fixed:** shots and assets created in Prism (or by another artist) while
+  the tracker is open now show up through live sync even when they have no
+  frame range or description yet, in both modes. Before, only a refresh
+  showed them.
+- **Fixed:** saving a new shot in the tracker that someone else created in
+  the meantime overwrote their frame range, and after a live sync what you
+  had typed into the unsaved row could land on their shot. Their values are
+  now kept, except for fields you changed yourself, and the status bar says
+  the shot already existed.
+- **Fixed:** a tracker edit still waiting to be saved on a task that was
+  deleted or renamed in Prism recreated the task's folder. The save now
+  stops and says the task no longer exists.
+- **Fixed:** after Add Task or Delete Task, the other tasks of that shot
+  could show an older status, until the next refresh.
+- **Fixed:** when a live sync happened between your edit and its save,
+  a change someone else made to the same field was no longer reported as a
+  conflict.
+- **Fixed:** Prism's **Edit Shot** dialog wrote back the frame range it
+  showed when it opened, even if you didn't touch it, undoing a newer range.
+  It now opens with the range on disk and only writes it if you change it.
+- **Fixed:** Prism's Create Shot / Create Asset on a name that already
+  exists (including Create Shot's **Next** button) overwrote that shot's
+  frame range, and replaced the asset's metadata (and with it its tracker
+  fields) with the dialog's rows. The stored range and fields are now kept.
+- **Fixed:** when the shot info file couldn't be read for a moment (a
+  network hiccup, say), saving a frame range in Prism replaced the whole file
+  with just that one range, losing every shot's tracker data. Nothing is
+  written then, and Prism says the range wasn't saved.
+- **Fixed:** an unsaved change on a shot, asset or task that was deleted or
+  renamed elsewhere disappeared without a word; the status bar now says
+  which changes were not kept.
+- **Fixed:** an FX layer edit that was still unsaved when a live sync came
+  in could save over someone else's newer change to the same field without
+  reporting the conflict.
+- **Fixed:** when the shot or asset info file couldn't be read for a
+  moment, a refresh showed every row blank and listed all of it as changed
+  elsewhere. The tracker now keeps showing what it read last and says the
+  file couldn't be read.
+- **Fixed:** Add Asset accepted a name already used by an asset in another
+  folder. Prism stores asset data by name, so the two overwrote each
+  other's description and fields. Such names are now refused.
+- **Fixed:** saving Configuration → Settings wrote every department list
+  back, undoing department changes someone else had saved meanwhile. Only
+  the lists you changed are written now.
+- **Fixed:** removing a deleted shot's or asset's leftover tracker data, and
+  moving it when an asset is renamed, could replace an info file that
+  couldn't be read with an almost empty one. Nothing is written then.
+- **Upgrading:** everyone on a project that uses a manager needs v1.1.0. An
+  older tracker keeps editing its own task statuses, which the new version
+  no longer shows while a manager is set.
+
+### v1.0.4
 
 Fixes for statuses and descriptions that sometimes went back to an older
 value (for example Completed back to In-progress) while Prism and the

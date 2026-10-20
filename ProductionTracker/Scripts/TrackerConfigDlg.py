@@ -29,6 +29,10 @@
 # both lists automatically and marks the end of the pipeline, so "finished"
 # stays one fixed, recognisable value.
 #
+# In task mode, for a project using Prism's Project Management, it also
+# picks which of the project's task statuses count as done and as not
+# needed (see TrackerPrismStatus).
+#
 ####################################################
 
 
@@ -38,7 +42,9 @@ from qtpy.QtWidgets import *
 
 from PrismUtils.Decorators import err_catcher_plugin as err_catcher
 
+import TrackerPrismStatus
 import TrackerSettings
+import TrackerTasks
 
 
 COL_COLOR = 0
@@ -274,6 +280,9 @@ class TrackerConfigDlg(QDialog):
         super(TrackerConfigDlg, self).__init__()
         self.core = core
         self.settings = TrackerSettings.TrackerSettings(core)
+        self.prismStatus = TrackerPrismStatus.PrismStatus(
+            core, TrackerTasks.TrackerTasks(core)
+        )
 
         self.core.parentWindow(self, parent=parent)
         self.setWindowTitle("Production Tracker - Settings")
@@ -315,6 +324,25 @@ class TrackerConfigDlg(QDialog):
         lo.addWidget(modeGroup)
 
         self.rb_modeShot.toggled.connect(self.updateModeHint)
+
+        # --- Prism task statuses (task mode with a Project Management manager)
+        self.pmGroup = QGroupBox("Prism task statuses")
+        pmLo = QVBoxLayout()
+        self.pmGroup.setLayout(pmLo)
+        self.l_pmNote = QLabel("")
+        self.l_pmNote.setWordWrap(True)
+        self.l_pmNote.setStyleSheet("color:#9ca3af;")
+        pmLo.addWidget(self.l_pmNote)
+        self.tw_pmStatuses = QTableWidget(0, 3)
+        self.tw_pmStatuses.setHorizontalHeaderLabels(["Status", "Counts as done", "Not needed"])
+        self.tw_pmStatuses.verticalHeader().setVisible(False)
+        self.tw_pmStatuses.setSelectionMode(QAbstractItemView.NoSelection)
+        self.tw_pmStatuses.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.tw_pmStatuses.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.tw_pmStatuses.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.tw_pmStatuses.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        pmLo.addWidget(self.tw_pmStatuses)
+        lo.addWidget(self.pmGroup, 1)
 
         # Everything below only applies to the "one task per shot" mode, so
         # it is hidden wholesale when Prism departments/tasks are in use -
@@ -386,6 +414,7 @@ class TrackerConfigDlg(QDialog):
         taskMode = self.rb_modeTasks.isChecked()
         self.deptSection.setVisible(not taskMode)
         self.b_defaults.setVisible(not taskMode)
+        self.pmGroup.setVisible(taskMode and self.prismStatus.active())
         # Let the dialog shrink back down when the section is hidden.
         self.resize(self.width(), self.sizeHint().height())
 
@@ -398,6 +427,13 @@ class TrackerConfigDlg(QDialog):
                 "anything entered in the other mode. A shot's description "
                 "and frame range are Prism's own and are shared by both "
                 "modes."
+                + (
+                    "\n\nThis project uses Prism's Project Management (%s), so "
+                    "task statuses are Prism's, the same ones the Project "
+                    "Browser shows." % self.prismStatus.manager
+                    if self.prismStatus.active()
+                    else ""
+                )
             )
         else:
             self.l_modeHint.setText(
@@ -411,15 +447,85 @@ class TrackerConfigDlg(QDialog):
         if not self.settings.hasProject():
             self.core.popup("No project is currently open.", parent=self)
 
+        statusSettings = self.settings.getPrismStatusSettings()
+        self.prismStatus.reload(
+            statusSettings["done_statuses"], statusSettings["skip_statuses"]
+        )
+        self.loadPrismStatuses()
+
         mode = self.settings.getTrackerMode()
         self.rb_modeTasks.setChecked(mode == TrackerSettings.MODE_TASKS)
         self.rb_modeShot.setChecked(mode != TrackerSettings.MODE_TASKS)
         self.updateModeHint()
 
         depts = self.settings.getDepartments()
+        # What the dialog opened with, so saving only writes the lists that
+        # were changed here (see onSave).
+        self._loadedDepts = {
+            "shot": [dict(d) for d in depts["shot"]],
+            "asset": [dict(d) for d in depts["asset"]],
+            "fxlayer": dict(depts["fxlayer"]),
+        }
         self.shotDeptBlock.table.setRows(depts["shot"])
         self.assetDeptBlock.table.setRows(depts["asset"])
         self.setFxDepartment(depts["fxlayer"])
+
+    @err_catcher(name=__name__)
+    def loadPrismStatuses(self):
+        """One row per task status of the project's manager."""
+        ps = self.prismStatus
+        self.l_pmNote.setText(
+            "Task statuses come from %s. Pick which ones count as done (the "
+            "task's row turns green and counts towards its shot's \"done\" "
+            "total) and which mean the task is no longer needed (its row "
+            "fades). The statuses themselves are edited in Prism: Project "
+            "Settings -> Project Management." % ps.description()
+        )
+        table = self.tw_pmStatuses
+        table.setRowCount(0)
+        for name in ps.names():
+            row = table.rowCount()
+            table.insertRow(row)
+            item = QTableWidgetItem(name)
+            item.setIcon(QIcon(makeSwatch(ps.color(name))))
+            table.setItem(row, 0, item)
+            for col, checked in ((1, ps.isDone(name)), (2, ps.isSkipped(name))):
+                box = QTableWidgetItem()
+                box.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
+                box.setCheckState(Qt.Checked if checked else Qt.Unchecked)
+                table.setItem(row, col, box)
+
+    @err_catcher(name=__name__)
+    def prismStatusChoices(self):
+        """(doneNames, skipNames) as ticked, each None when it matches what
+        the status names suggest anyway - so statuses added to the project
+        later are still judged by their names."""
+        table = self.tw_pmStatuses
+        names = [table.item(r, 0).text() for r in range(table.rowCount())]
+
+        def ticked(col):
+            return [
+                names[r] for r in range(table.rowCount())
+                if table.item(r, col).checkState() == Qt.Checked
+            ]
+
+        # The same statuses, judged by name only.
+        byName = TrackerPrismStatus.PrismStatus(self.core, None)
+        byName.entries = self.prismStatus.entries
+
+        def choice(col, stored, test):
+            chosen = ticked(col)
+            # Choices for statuses not listed here (no longer in the
+            # project's list, for now) are kept rather than dropped.
+            hidden = [n for n in stored or [] if n not in names]
+            if not hidden and chosen == [n for n in names if test(n)]:
+                return None
+            return chosen + hidden
+
+        return (
+            choice(1, self.prismStatus.doneNames, byName.isDone),
+            choice(2, self.prismStatus.skipNames, byName.isSkipped),
+        )
 
     @err_catcher(name=__name__)
     def setFxDepartment(self, fx):
@@ -519,9 +625,27 @@ class TrackerConfigDlg(QDialog):
             else TrackerSettings.MODE_SHOT
         )
 
+        # Only the lists changed in this dialog are written; the others keep
+        # what is stored now, so someone else's edit to them since the dialog
+        # opened isn't put back.
+        loaded = getattr(self, "_loadedDepts", None) or {}
+        changed = [k for k in departments if departments[k] != loaded.get(k)]
+
         try:
             self.settings.saveTrackerMode(mode)
-            self.settings.saveDepartments(departments)
+            if changed:
+                current = self.settings.getDepartments()
+                for kind in changed:
+                    current[kind] = departments[kind]
+                self.settings.saveDepartments(current)
+            # Only when the statuses could be listed here: without them (a
+            # Kitsu project on a machine without Prism's plugin, say) the
+            # empty table would wipe what someone else chose.
+            if self.prismStatus.active() and self.prismStatus.entries:
+                done, skip = self.prismStatusChoices()
+                self.settings.savePrismStatusSettings(
+                    {"done_statuses": done, "skip_statuses": skip}
+                )
         except Exception as e:
             self.core.popup("Could not save the settings:\n\n%s" % e, parent=self)
             return

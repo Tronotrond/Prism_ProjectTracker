@@ -223,9 +223,11 @@ class TrackerTasks(object):
         if not path:
             raise RuntimeError("Could not resolve the task data path.")
 
+        # The task's folder is Prism's: a missing one means the task was
+        # deleted or renamed, and creating it here would bring it back.
         folder = os.path.dirname(path)
-        if folder and not os.path.exists(folder):
-            os.makedirs(folder)
+        if folder and not os.path.isdir(folder):
+            raise RuntimeError("the task no longer exists in Prism")
 
         current = self.readFresh(entity, department, task)
         current.update(values or {})

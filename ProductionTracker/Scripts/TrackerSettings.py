@@ -128,6 +128,21 @@ DEFAULT_SETTINGS = {
     "tracker_mode": MODE_SHOT,
 }
 
+# Task statuses from Prism's Project Management (see TrackerPrismStatus),
+# kept in a section of their own: trackers before 1.1.0 rewrite the whole
+# "settings" section with only the keys they know, which would wipe these.
+#   done_statuses / skip_statuses  which of the project's statuses count as
+#       done / not needed (None: go by their names)
+#   status_source  where task statuses came from when the tracker last
+#       looked: "" for its own, else the manager's name; None until a tracker
+#       that knows about managers has opened the project
+CAT_PRISM_STATUS = "prism_status"
+DEFAULT_PRISM_STATUS = {
+    "done_statuses": None,
+    "skip_statuses": None,
+    "status_source": None,
+}
+
 
 class TrackerSettings(object):
     """Read/write the tracker's per-project config file."""
@@ -253,6 +268,33 @@ class TrackerSettings(object):
         return settings
 
     @err_catcher(name=__name__)
+    def getPrismStatusSettings(self):
+        """The Prism task status settings (see DEFAULT_PRISM_STATUS)."""
+        out = dict(DEFAULT_PRISM_STATUS)
+        stored = self.readAll().get(CAT_PRISM_STATUS)
+        if isinstance(stored, dict):
+            for key in ("done_statuses", "skip_statuses"):
+                value = stored.get(key)
+                if isinstance(value, list):
+                    out[key] = [s for s in value if isinstance(s, str)]
+            if isinstance(stored.get("status_source"), str):
+                out["status_source"] = stored["status_source"]
+        return out
+
+    @err_catcher(name=__name__)
+    def savePrismStatusSettings(self, values):
+        """Update some of the Prism task status settings, keeping the rest."""
+        merged = self.getPrismStatusSettings() or dict(DEFAULT_PRISM_STATUS)
+        merged.update(values or {})
+        self.ensureConfigFolder()
+        self.core.configs.setConfig(
+            cat=CAT_PRISM_STATUS,
+            val=merged,
+            configPath=self.getConfigPath(),
+            updateNestedData=False,
+        )
+
+    @err_catcher(name=__name__)
     def isEnabled(self):
         """Is user management switched on for this project?"""
         return self.getSettings()["enabled"]
@@ -267,6 +309,16 @@ class TrackerSettings(object):
         settings = self.getSettings()
         settings["tracker_mode"] = mode if mode in TRACKER_MODES else MODE_SHOT
         self.saveSettings(settings)
+
+    @err_catcher(name=__name__)
+    def getStatusSource(self):
+        """Where task statuses came from when last checked (see
+        DEFAULT_PRISM_STATUS)."""
+        return self.getPrismStatusSettings()["status_source"]
+
+    @err_catcher(name=__name__)
+    def saveStatusSource(self, source):
+        self.savePrismStatusSettings({"status_source": source or ""})
 
     @err_catcher(name=__name__)
     def notificationsActive(self):

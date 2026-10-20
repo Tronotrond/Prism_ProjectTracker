@@ -58,6 +58,7 @@ from PrismUtils.Decorators import err_catcher_plugin as err_catcher
 import Prism_ProductionTracker_Variables as PluginVars
 import TrackerSettings
 import TrackerTasks
+import TrackerPrismStatus
 import TrackerTeam
 import TrackerComments
 import TrackerCommentsWidget
@@ -245,6 +246,12 @@ ROLE_FADEROW = Qt.UserRole + 8
 ROLE_ROLLUP = Qt.UserRole + 9
 # On a department folder in task mode: (abbreviation, longName).
 ROLE_DEPT = Qt.UserRole + 10
+# On a row whose unsaved edit was kept through a rebuild: {field: value read
+# by that rebuild} for the edited fields that someone else had changed. The
+# row's baseline for them is the value they were edited from (so the save
+# sees both changes), which leaves this the only record of what is stored
+# now - needed if the edit is then undone (see nothingToSave).
+ROLE_STOREDNOW = Qt.UserRole + 11
 
 THUMB_W = 96
 THUMB_H = 54
@@ -966,15 +973,43 @@ class AddAssetDialog(BulkDialog):
             if not row["asset_path"]:
                 return "Every row needs an asset path."
 
-        dupes = self.duplicatesWithin(rows, lambda r: r["asset_path"].lower())
+        def path(text):
+            return text.replace("\\", "/").strip("/").lower()
+
+        def name(text):
+            return path(text).rsplit("/", 1)[-1]
+
+        dupes = self.duplicatesWithin(rows, lambda r: path(r["asset_path"]))
         if dupes:
             return "Listed more than once: %s" % ", ".join(dupes)
 
         clashes = [
-            r["asset_path"] for r in rows if r["asset_path"].lower() in self.existing
+            r["asset_path"] for r in rows if path(r["asset_path"]) in self.existing
         ]
         if clashes:
             return "Already in this project: %s" % ", ".join(clashes)
+
+        # Prism keeps an asset's description and data by its name alone, so
+        # two assets with the same name in different folders would share it,
+        # and saving one would overwrite the other's.
+        sameName = self.duplicatesWithin(rows, lambda r: name(r["asset_path"]))
+        if sameName:
+            return (
+                "Two assets can't have the same name, even in different "
+                "folders (Prism stores asset data by name): %s" % ", ".join(sameName)
+            )
+        taken = dict((name(p), p) for p in self.existing)
+        named = [
+            "%s (as %s)" % (r["asset_path"], taken[name(r["asset_path"])])
+            for r in rows
+            if name(r["asset_path"]) in taken
+        ]
+        if named:
+            return (
+                "An asset with this name already exists in another folder, and "
+                "Prism stores asset data by name, so the two would overwrite "
+                "each other's: %s" % ", ".join(named)
+            )
         return ""
 
 
@@ -1157,6 +1192,11 @@ class ProductionTrackerDlg(QDialog):
         # Per-project settings, team roster and notifications.
         self.settings = TrackerSettings.TrackerSettings(core)
         self.tasks = TrackerTasks.TrackerTasks(core)
+        # Task statuses from Prism's Project Management, when the project
+        # uses a manager (see TrackerPrismStatus and loadOptions).
+        self.prismStatus = TrackerPrismStatus.PrismStatus(core, self.tasks)
+        self.pmActive = False
+        self._checkingSource = False
         self.trackerMode = TrackerSettings.MODE_SHOT
         self.loadOptions()
         self.team = TrackerTeam.TrackerTeam(core)
@@ -1202,7 +1242,7 @@ class ProductionTrackerDlg(QDialog):
         self._readState = self.loadReadState()
 
         self.core.parentWindow(self, parent=parent)
-        self.setWindowTitle("Production Tracker")
+        self.setWindowTitle("%s %s" % (PluginVars.PLUGIN_NAME, PluginVars.PLUGIN_VERSION))
         self.resize(1800, 900)
 
         self.setupUi()
@@ -1243,10 +1283,17 @@ class ProductionTrackerDlg(QDialog):
         """Read this project's department options into lookup tables.
 
         Called before the UI is built and again on every refresh, so editing
-        them in Settings takes effect without reopening the tracker. Statuses
-        are fixed (see STATUSES) and need no loading.
+        them in Settings takes effect without reopening the tracker. The
+        tracker's own statuses are fixed (see STATUSES); in task mode a
+        project using Prism's Project Management has its own task statuses
+        instead, which are read here too.
         """
         self.trackerMode = self.settings.getTrackerMode()
+        statusSettings = self.settings.getPrismStatusSettings()
+        self.prismStatus.reload(
+            statusSettings["done_statuses"], statusSettings["skip_statuses"]
+        )
+        self.pmActive = self.taskMode() and self.prismStatus.active()
         depts = self.settings.getDepartments()
         self.deptShot = self.settings.departmentNames("shot", depts)
         self.deptAsset = self.settings.departmentNames("asset", depts)
@@ -1268,6 +1315,31 @@ class ProductionTrackerDlg(QDialog):
         """True while the tracker is grouping by Prism departments/tasks."""
         return self.trackerMode == TrackerSettings.MODE_TASKS
 
+    # A task row's status is Prism's (see TrackerPrismStatus) while the
+    # project uses a Project Management manager; every other row, and every
+    # row of a project without one, uses the tracker's own five statuses.
+    def prismStatusRow(self, item):
+        entity = (item.data(0, ROLE_ENTITY) if item is not None else None) or {}
+        return self.pmActive and entity.get("type") == "task"
+
+    def statusChoices(self, prism=False):
+        return self.prismStatus.names() if prism else list(STATUSES)
+
+    def statusColor(self, status, prism=False):
+        if prism:
+            return self.prismStatus.color(status, NEUTRAL_COLOR)
+        return STATUS_COLORS.get(status, NEUTRAL_COLOR)
+
+    def isDoneStatus(self, status, prism=False):
+        if prism:
+            return self.prismStatus.isDone(status)
+        return status == STATUS_COMPLETED
+
+    def isSkippedStatus(self, status, prism=False):
+        if prism:
+            return self.prismStatus.isSkipped(status)
+        return status == STATUS_NOT_NEEDED
+
     @err_catcher(name=__name__)
     def applyModeVisibility(self):
         """Hide what the current mode does not use.
@@ -1276,6 +1348,13 @@ class ProductionTrackerDlg(QDialog):
         would only duplicate the row's own parent folder.
         """
         self.tree.setColumnHidden(COL_DEPARTMENT, self.taskMode())
+        self.actCopyStatuses.setVisible(self.taskMode())
+        self.tree.headerItem().setToolTip(
+            COL_STATUS,
+            "Task statuses: %s." % self.prismStatus.description()
+            if self.taskMode()
+            else "",
+        )
 
     @err_catcher(name=__name__)
     def applyUserManagementVisibility(self):
@@ -1321,6 +1400,11 @@ class ProductionTrackerDlg(QDialog):
         self.actSettings.setToolTip(
             "Edit the status and department options for this project."
         )
+        self.actCopyStatuses = configMenu.addAction("Copy Task Statuses...")
+        self.actCopyStatuses.setToolTip(
+            "Copy task statuses between the tracker and Prism's Project "
+            "Management (Prism departments and tasks mode)."
+        )
         configMenu.addSeparator()
         self.actColorRows = configMenu.addAction("Color rows by user color")
         self.actColorRows.setCheckable(True)
@@ -1352,6 +1436,10 @@ class ProductionTrackerDlg(QDialog):
         f.setBold(True)
         title.setFont(f)
         headerLo.addWidget(title)
+        version = QLabel(PluginVars.PLUGIN_VERSION)
+        version.setStyleSheet("color:#9ca3af;")
+        version.setAlignment(Qt.AlignBottom)
+        headerLo.addWidget(version)
         headerLo.addStretch()
 
         self.e_search = QLineEdit()
@@ -1461,6 +1549,7 @@ class ProductionTrackerDlg(QDialog):
         self.commentsPanel.changed.connect(self.onCommentsChanged)
         self.actClose.triggered.connect(self.close)
         self.actSettings.triggered.connect(self.openSettings)
+        self.actCopyStatuses.triggered.connect(self.onCopyStatuses)
         self.actAbout.triggered.connect(self.openAbout)
         self.actColorRows.toggled.connect(self.onToggleColorRows)
         self.actShowThumbs.toggled.connect(self.onToggleThumbnails)
@@ -1922,14 +2011,15 @@ class ProductionTrackerDlg(QDialog):
         department = deptCb.currentText() if deptCb else ""
 
         entity = item.data(0, ROLE_ENTITY) or {}
+        prism = self.prismStatusRow(item)
         # A task row has no department of its own - the tree groups by it -
         # so being Completed is enough to count as wrapped up.
         endOfLine = (
-            status == STATUS_COMPLETED
+            self.isDoneStatus(status, prism)
             and (entity.get("type") == "task" or department == APPROVED_DEPT)
         )
 
-        faded = status == STATUS_NOT_NEEDED
+        faded = self.isSkippedStatus(status, prism)
         color = None
         if not faded:
             if endOfLine:
@@ -2017,6 +2107,22 @@ class ProductionTrackerDlg(QDialog):
         except Exception:
             pass
 
+        # An info file that can't be read just now (a network hiccup) would
+        # rebuild every row blank, and report all of it as changed elsewhere.
+        # Keep the rows read last instead; the file's recovery moves its
+        # mtime, and live sync then rebuilds.
+        if getattr(self, "shotsRoot", None) is not None:
+            try:
+                for path in self.cfgPaths():
+                    self.readInfoFile(path)
+            except Exception as e:
+                self._lastSyncMtimes = mtimes
+                self.l_status.setText(
+                    "Could not read the shot/asset info file (%s); showing what was "
+                    "read last. It is read again when it changes, or on Refresh." % e
+                )
+                return False
+
         self._building = True
         try:
             self.rebuildTree(preserve)
@@ -2028,7 +2134,33 @@ class ProductionTrackerDlg(QDialog):
         # would read as changes made elsewhere.
         if self.viewContext() != context:
             before = {}
+        # Statuses this window just copied (Copy Task Statuses) aren't changes
+        # made outside it; anything else that changed meanwhile still is.
+        for key in getattr(self, "_ownBulkWrite", None) or ():
+            if key in before:
+                isRollup, snap = before[key]
+                snap = dict(snap)
+                snap.pop("status", None)
+                before[key] = (isRollup, snap)
+        self._ownBulkWrite = None
         self.reportExternalChanges(before)
+        self.appendEditsNotKept(replace=True)
+        dropped = getattr(self, "_statusEditsDropped", None)
+        if dropped:
+            self._statusEditsDropped = None
+            # Kept for the copy prompt that may follow (see showCopyResult),
+            # whose refresh would replace this label.
+            self._statusDropNote = (
+                "Unsaved status changes with no matching status were not kept: %s"
+                % ", ".join(dropped)
+            )
+            self.l_status.setText(
+                "Task statuses now come from %s. %s"
+                % (self.prismStatus.description(), self._statusDropNote)
+            )
+        if self.taskMode() and not self._checkingSource:
+            QTimer.singleShot(0, self.checkStatusSource)
+        return True
 
     @err_catcher(name=__name__)
     def viewContext(self):
@@ -2036,6 +2168,8 @@ class ProductionTrackerDlg(QDialog):
         return (
             getattr(self, "trackerMode", None),
             getattr(self, "userMgmtEnabled", None),
+            # Task statuses switch between the tracker's and Prism's.
+            self.pmActive and self.prismStatus.manager,
             getattr(self, "deptFx", None),
             tuple(sorted(getattr(self, "deptAll", None) or ())),
             tuple(
@@ -2050,12 +2184,19 @@ class ProductionTrackerDlg(QDialog):
         # Project team roster + who "I" am on this machine. With user
         # management off the roster is empty, currentUser is None and comments
         # fall back to the plain Prism username (see currentTrackerUsername).
+        statusSource = (self.pmActive, self.prismStatus.manager)
+        oldEntries = list(self.prismStatus.entries)
         self.loadOptions()
+        if preserve and statusSource != (self.pmActive, self.prismStatus.manager):
+            self.carryStatusEdits(preserve, statusSource[0], oldEntries)
         self.userMgmtEnabled = self.settings.isEnabled()
         self.teamUsers = self.team.loadUsers()
         self.currentUser = self.team.resolveCurrentUser(self.teamUsers)
         self.avatarCache = {}
         self.commentsPanel.setUsers(self.teamUsers)
+        # "@remindme Status changes to..." offers the statuses rows use: in
+        # task mode with a manager, every commentable row is a task.
+        self.commentsPanel.setStatuses(self.statusChoices(self.pmActive))
         self.commentsPanel.setMentionsEnabled(self.userMgmtEnabled)
         self.applyUserManagementVisibility()
         self.applyModeVisibility()
@@ -2106,6 +2247,7 @@ class ProductionTrackerDlg(QDialog):
 
         self.assetsRoot = self.makeSectionItem("ASSETS")
         self.buildAssetTree(assets)
+        self.watchEntityFolders(shots, assets)
 
         # Re-attach still-unsaved new rows.
         for entity in self.newRows:
@@ -2126,6 +2268,67 @@ class ProductionTrackerDlg(QDialog):
         self.updateStatusLabel()
         self.updateNotesPanel()
         self.applyAllRowColors()
+
+    @err_catcher(name=__name__)
+    def appendEditsNotKept(self, replace=False):
+        """Say in the status bar which unsaved changes a rebuild couldn't put
+        back, as their row was deleted or renamed elsewhere (see
+        restoreTreeState). Added after the label, or replacing it."""
+        lost = getattr(self, "_editsNotKept", None)
+        if not lost:
+            return
+        self._editsNotKept = None
+        note = "Unsaved changes were not kept, as these were deleted or renamed elsewhere: %s%s" % (
+            "; ".join(lost[:5]),
+            " and %d more" % (len(lost) - 5) if len(lost) > 5 else "",
+        )
+        text = "" if replace else self.l_status.text()
+        self.l_status.setText((text + "  " + note).strip())
+
+    @err_catcher(name=__name__)
+    def carryStatusEdits(self, preserve, wasPrism, oldEntries):
+        """Task statuses just switched between the tracker's and Prism's (or
+        another manager's) while rows had unsaved status edits: carry each
+        edit over to the matching status of the new list.
+
+        Put back as it is, the edit would be saved into the new list as an
+        unknown status. One with no match is dropped, and the status bar
+        says which.
+        """
+        dropped = []
+        for key, edited in preserve.get("dirty", {}).items():
+            if not (isinstance(key, tuple) and key[:1] == ("task",) and "status" in edited):
+                continue
+            value = edited["status"]
+            if self.pmActive and not wasPrism:
+                mapped = self.prismStatus.trackerToPrism(value)
+            elif self.pmActive:
+                # From one manager's list to another's: only the same name.
+                mapped = value if value in self.prismStatus.names() else None
+            else:
+                abbreviation = ""
+                for e in oldEntries:
+                    if e["name"] == value:
+                        abbreviation = e["abbreviation"]
+                mapped = TrackerPrismStatus.PrismStatus.prismToTracker(
+                    value, STATUSES, abbreviation
+                )
+                if mapped not in STATUSES:
+                    mapped = None
+            # Its old baseline belonged to the other list; the rebuilt row's
+            # baseline is the status stored in the new one.
+            preserve.get("base", {}).get(key, {}).pop("status", None)
+            if mapped:
+                edited["status"] = mapped
+            else:
+                edited.pop("status")
+                dropped.append("%s '%s'" % (key[-1], value))
+        if dropped:
+            self._statusEditsDropped = dropped
+            logger.warning(
+                "Production Tracker: task statuses changed source; unsaved status "
+                "edits with no match were not kept: %s", ", ".join(dropped)
+            )
 
     @err_catcher(name=__name__)
     def storedSnapshots(self):
@@ -2257,13 +2460,45 @@ class ProductionTrackerDlg(QDialog):
 
     @err_catcher(name=__name__)
     def currentMtimes(self):
+        """What live sync compares between ticks: the info files' mtimes, and
+        in task mode the project's Project Management settings (see
+        projectStatusKey)."""
         mtimes = {}
         for p in self.cfgPaths():
             try:
                 mtimes[p] = os.path.getmtime(p) if os.path.exists(p) else 0
             except Exception:
                 mtimes[p] = 0
+        if self.taskMode():
+            mtimes["prjManagement"] = self.projectStatusKey()
         return mtimes
+
+    @err_catcher(name=__name__)
+    def projectStatusKey(self):
+        """The project's Project Management settings, comparable between
+        ticks. They say whether task statuses are Prism's (and which), so a
+        manager switched on or off elsewhere is picked up within a tick
+        rather than at the next rebuild.
+
+        Compared by content, not by the file's mtime: Prism plugins rewrite
+        pipeline.json unchanged whenever someone opens the project, which
+        would rebuild every open tracker each time. The file is only read
+        again when its mtime has moved.
+        """
+        try:
+            path = self.core.configs.getConfigPath(config="project")
+            mtime = os.path.getmtime(path)
+        except Exception:
+            return None
+        cached = getattr(self, "_projectStatusKey", None)
+        if cached and cached[0] == mtime:
+            return cached[1]
+        settings = self.prismStatus.projectSettings()
+        if settings is None:
+            return cached[1] if cached else None  # unreadable for a moment
+        key = json.dumps(settings, sort_keys=True, default=str)
+        self._projectStatusKey = (mtime, key)
+        return key
 
     @err_catcher(name=__name__)
     def onSyncTick(self):
@@ -2323,6 +2558,53 @@ class ProductionTrackerDlg(QDialog):
             self._taskWatch[path] = statMtime(path)
 
     @err_catcher(name=__name__)
+    def watchEntityFolders(self, shots, assets):
+        """Watch the folders new shots and assets are created in.
+
+        A shot or asset created elsewhere without a frame range or a
+        description leaves the shot/asset info files untouched, so it
+        would only show up at the next manual refresh. Creating it adds a
+        folder, which changes its parent folder's timestamp: the shot and
+        asset roots, each sequence (and episode) folder, and each folder
+        assets sit in. Checked with the task files (see pollTaskFiles).
+        """
+        folders = set()
+        for root in ("sequencePath", "assetPath"):
+            try:
+                path = os.path.normpath(getattr(self.core, root) or "")
+            except Exception:
+                continue
+            # In an episode project Prism's sequence path still holds the
+            # unresolved "@episode@" part; the folder above it is the root.
+            parts = path.split(os.sep)
+            for i, part in enumerate(parts):
+                if "@" in part:
+                    path = os.sep.join(parts[:i])
+                    break
+            if path and path != ".":
+                folders.add(path)
+        for entity in shots + assets:
+            try:
+                path = self.core.getEntityPath(entity=entity)
+            except Exception:
+                path = None
+            if not path:
+                continue
+            parent = os.path.dirname(os.path.normpath(path))
+            folders.add(parent)
+            if entity.get("type") == "shot":
+                folders.add(os.path.dirname(parent))  # the episode, if any
+            else:
+                # Nested asset folders, up to the asset root.
+                root = os.path.normcase(os.path.normpath(getattr(self.core, "assetPath", "") or ""))
+                while root and os.path.normcase(parent).startswith(root + os.sep):
+                    parent = os.path.dirname(parent)
+                    folders.add(parent)
+        for folder in folders:
+            if folder:
+                self.watchPath(folder)
+
+    @err_catcher(name=__name__)
     def markTaskFileSeen(self, entity, department, task):
         """After writing a task file ourselves, so it isn't taken for a
         change by someone else and trigger a needless rebuild."""
@@ -2344,7 +2626,9 @@ class ProductionTrackerDlg(QDialog):
         depends on it, because every save merges against the files as they
         are at that moment (see mergeRowValues).
         """
-        if not self.taskMode() or not self._taskWatch:
+        # Both modes: shot mode watches the folders new shots and assets
+        # appear in (see watchEntityFolders).
+        if not self._taskWatch:
             return
 
         result = self._taskPollResult
@@ -2378,6 +2662,55 @@ class ProductionTrackerDlg(QDialog):
         self._taskPollThread.start()
 
     @err_catcher(name=__name__)
+    def requestSync(self):
+        """Something changed in this Prism session (the Project Browser or
+        one of Prism's dialogs; see the plugin's onPrismChanged): check for
+        it now instead of at the next poll. The usual rules apply, so it
+        still waits while something is being edited here."""
+        if not self.isVisible():
+            return
+        self._lastTaskPoll = 0
+        self.pollTaskFiles()
+        # The info files are compared straight away; the task and folder
+        # check runs in the background and is picked up a moment later.
+        for delay in (150, 1200):
+            QTimer.singleShot(delay, self.onSyncTick)
+
+    @err_catcher(name=__name__)
+    def schedulePrismRefresh(self):
+        """After an autosave: refresh what Prism's Project Browser shows of
+        the saved data, once edits have settled (see refreshPrismBrowser)."""
+        if not hasattr(self, "prismRefreshTimer"):
+            self.prismRefreshTimer = QTimer(self)
+            self.prismRefreshTimer.setSingleShot(True)
+            self.prismRefreshTimer.setInterval(800)
+            self.prismRefreshTimer.timeout.connect(self.refreshPrismBrowser)
+        self.prismRefreshTimer.start()
+
+    @err_catcher(name=__name__)
+    def refreshPrismBrowser(self):
+        """Update the parts of an open Project Browser that show tracker data
+        - the selected shot/asset's info (description, frame range) and its
+        task list (Prism task statuses) - without rebuilding the whole
+        browser, as a manual Save does (refreshPrismUI). Rebuilding it after
+        every autosave would keep resetting what someone is doing in it."""
+        pb = getattr(self.core, "pb", None)
+        if not pb or not self.core.isObjectValid(pb) or not pb.isVisible():
+            return
+        sb = getattr(pb, "sceneBrowser", None)
+        if sb is None or not self.core.isObjectValid(sb):
+            return
+        tabs = getattr(pb, "tbw_project", None)
+        if tabs is not None and tabs.currentWidget() is not sb:
+            # Not showing: reloaded when its tab is opened.
+            sb.refreshStatus = "invalid"
+            return
+        if hasattr(sb, "refreshEntityInfo"):
+            sb.refreshEntityInfo()
+        if hasattr(sb, "refreshTasks"):
+            sb.refreshTasks(restoreSelection=True)
+
+    @err_catcher(name=__name__)
     def liveSync(self):
         self._syncing = True
         try:
@@ -2386,7 +2719,8 @@ class ProductionTrackerDlg(QDialog):
             # than rebuild and risk discarding unsaved changes.
             if state is None:
                 return
-            self.refresh(preserve=state)
+            if not self.refresh(preserve=state):
+                return
             stamp = datetime.datetime.now().strftime("%H:%M:%S")
             base = self.l_status.text().split("   —")[0]
             self.l_status.setText("%s   —  synced remote changes at %s" % (base, stamp))
@@ -2411,6 +2745,17 @@ class ProductionTrackerDlg(QDialog):
         # Windows), so normalise or the same asset keys differently depending
         # on where the dict came from.
         return ("asset", (entity.get("asset_path") or "").replace("\\", "/"))
+
+    @err_catcher(name=__name__)
+    def dirtyKey(self, item):
+        """The key a row's unsaved edits are kept under through a rebuild.
+
+        A new row that isn't saved yet is kept apart from a saved row for
+        the same entity: if someone creates that shot elsewhere meanwhile,
+        the rebuild shows both, and what was typed into the new row must not
+        land on the existing one."""
+        key = self.entityKey(item.data(0, ROLE_ENTITY) or {})
+        return ("new",) + key if item.data(0, ROLE_ISNEW) else key
 
     @err_catcher(name=__name__)
     def nodePath(self, item):
@@ -2439,6 +2784,9 @@ class ProductionTrackerDlg(QDialog):
     def captureTreeState(self):
         state = {
             "dirty": {},
+            # The stored values the edits in "dirty" were made against (see
+            # restoreTreeState), keyed the same way.
+            "base": {},
             "expanded": set(),
             "scroll": self.tree.verticalScrollBar().value(),
             "selected": None,
@@ -2457,7 +2805,12 @@ class ProductionTrackerDlg(QDialog):
                 k: v for k, v in self.getRowValues(item).items() if v != snap.get(k)
             }
             if edited:
-                state["dirty"][self.entityKey(item.data(0, ROLE_ENTITY))] = edited
+                key = self.dirtyKey(item)
+                state["dirty"][key] = edited
+                state["base"][key] = dict((k, copy.deepcopy(snap.get(k))) for k in edited)
+                state.setdefault("labels", {})[key] = self.shortEntityLabel(
+                    item.data(0, ROLE_ENTITY) or {}
+                )
 
         def walkNodes(parent):
             for i in range(parent.childCount()):
@@ -2478,20 +2831,66 @@ class ProductionTrackerDlg(QDialog):
     def restoreTreeState(self, state):
         # Re-apply unsaved local edits so live sync never discards them.
         dirty = state.get("dirty", {})
+        bases = state.get("base", {})
+        applied = set()
         selectItem = None
         for item in self.iterLeafItems() + self.rollupItems():
             entity = item.data(0, ROLE_ENTITY)
             key = self.entityKey(entity)
-            if key in dirty:
-                values = dict(dirty[key])
+            editKey = self.dirtyKey(item)
+            if editKey in dirty:
+                applied.add(editKey)
+                values = dict(dirty[editKey])
                 if "notes" in values:
                     # Keep comments that arrived with the rebuild as well.
                     values["notes"] = TrackerComments.merge_comments(
                         item.data(0, ROLE_NOTES), values["notes"]
                     )
                 self.setRowValues(item, values)
+                # The rebuilt row's baseline is what is stored now. For the
+                # edited fields put back the value they were edited from, so
+                # if someone else changed the same field meanwhile the save
+                # still sees both changes and reports the conflict.
+                base = bases.get(editKey)
+                if base:
+                    snap = dict(item.data(0, ROLE_SNAPSHOT) or {})
+                    # A row the rebuild left in place (rebuildTaskRows of
+                    # another entity) keeps what an earlier sync recorded.
+                    storedNow = dict(item.data(0, ROLE_STOREDNOW) or {})
+                    for k, v in base.items():
+                        if k in values and k != "notes":
+                            if snap.get(k) != v:
+                                storedNow[k] = snap.get(k)
+                            snap[k] = v
+                    item.setData(0, ROLE_SNAPSHOT, snap)
+                    item.setData(0, ROLE_STOREDNOW, storedNow or None)
+                    if entity.get("type") == "fxlayer" and item.parent() is not None:
+                        # An FX layer is saved as part of its shot's list,
+                        # merged against ROLE_FXSNAPSHOT: give that the same
+                        # baseline as the row.
+                        fxSnap = copy.deepcopy(item.parent().data(0, ROLE_FXSNAPSHOT) or [])
+                        for layer in fxSnap:
+                            if layer.get("id") == entity.get("fx_id"):
+                                for k, v in base.items():
+                                    if k in values and k != "notes":
+                                        layer[k] = copy.deepcopy(v)
+                        item.parent().setData(0, ROLE_FXSNAPSHOT, fxSnap)
             if state.get("selected") is not None and key == state["selected"]:
                 selectItem = item
+
+        # Edits whose row is gone: deleted or renamed elsewhere since. (An
+        # unsaved new row is rebuilt from self.newRows, so it is never gone.)
+        lost = [
+            state.get("labels", {}).get(k) or str(k[-1])
+            for k, edited in dirty.items()
+            if edited and k not in applied and k[:1] != ("new",)
+        ]
+        if lost:
+            self._editsNotKept = lost
+            logger.warning(
+                "Production Tracker: unsaved changes not kept, as these were deleted "
+                "or renamed elsewhere: %s", "; ".join(lost)
+            )
 
         # Restore folder expansion.
         expanded = state.get("expanded", set())
@@ -2536,7 +2935,9 @@ class ProductionTrackerDlg(QDialog):
                 widget.setCurrentText(values[key])
 
         setCombo(self.cellWidget(item, COL_ASSIGNEE), "assignee")
-        setCombo(self.cellWidget(item, COL_STATUS), "status")
+        statusCb = self.cellWidget(item, COL_STATUS)
+        if statusCb is not None and "status" in values:
+            self.setStatusComboValue(statusCb, values["status"])
         setCombo(self.cellWidget(item, COL_DEPARTMENT), "department")
 
         dueW = self.cellWidget(item, COL_DUE)
@@ -2665,6 +3066,7 @@ class ProductionTrackerDlg(QDialog):
 
         if saved:
             self.markOwnWrite(mtimes)
+            self.schedulePrismRefresh()
             stamp = datetime.datetime.now().strftime("%H:%M:%S")
             msg = "Auto-saved %d change(s) at %s" % (saved, stamp)
             # Values someone else changed, merged in by this save.
@@ -2672,6 +3074,11 @@ class ProductionTrackerDlg(QDialog):
             if merged:
                 msg += "  " + self.externalChangesMessage()
             self.l_status.setText(msg)
+        elif merged:
+            # Nothing written, but a value changed elsewhere was taken over
+            # and is now shown (an edit undone after a sync): say so.
+            self._externalChanges = merged
+            self.l_status.setText(self.externalChangesMessage())
         if self._conflicts:
             self.l_status.setText(self.conflictMessage())
         if errors:
@@ -2740,7 +3147,9 @@ class ProductionTrackerDlg(QDialog):
             shot = entity.get("shot") or ""
             where = "%s / %s" % (seq, shot) if seq else shot
         elif entity.get("type") == "asset":
-            where = entity.get("asset_path") or self.leafDisplayName(entity, False)
+            where = (entity.get("asset_path") or "").replace("\\", "/").strip("/") or (
+                self.leafDisplayName(entity, False)
+            )
         else:
             where = self.leafDisplayName(entity, False)
         return "%s / %s" % (project, where) if project else where
@@ -2813,8 +3222,16 @@ class ProductionTrackerDlg(QDialog):
         # comment attached to this entity. Uses the freshly-read remote value
         # as "before", so this only fires for the change *this* client is
         # committing right now (checked at save/close time, per design).
-        remoteStatus = normalizeStatus((remoteMeta or {}).get(STATUS_KEY, {}).get("value"))
-        newStatus = values.get("status", STATUS_NOT_STARTED)
+        storedStatus = (remoteMeta or {}).get(STATUS_KEY, {}).get("value")
+        if self.pmActive and entity.get("type") == "task":
+            # Prism's own status, compared as it is: normalizeStatus would
+            # turn "" into "Not started" and "In Progress" into "In-progress",
+            # which read as a change on every save.
+            remoteStatus = storedStatus or ""
+            newStatus = values.get("status", "")
+        else:
+            remoteStatus = normalizeStatus(storedStatus)
+            newStatus = values.get("status", STATUS_NOT_STARTED)
         remoteDept = (remoteMeta or {}).get(DEPT_KEY, {}).get("value", DEPT_NONE)
         remoteDept = self.migrateDepartment(remoteDept)
         newDept = values.get("department", DEPT_NONE)
@@ -2987,14 +3404,22 @@ class ProductionTrackerDlg(QDialog):
             )
 
     @err_catcher(name=__name__)
-    def taskFieldValues(self, data):
+    def taskFieldValues(self, data, parent, department, task):
         """A task's stored fields (from its info file), normalised likewise."""
         return {
             "assignee": self.resolveAssignee(data.get(TASK_KEYS["assignee"], "") or ""),
-            "status": normalizeStatus(data.get(TASK_KEYS["status"])),
+            "status": self.taskStatusValue(data, parent, department, task),
             "due": data.get(TASK_KEYS["due"], "") or "",
             "desc": data.get(TASK_KEYS["desc"], "") or "",
         }
+
+    @err_catcher(name=__name__)
+    def taskStatusValue(self, data, parent, department, task):
+        """A task's status as its row shows it: Prism's while the project
+        uses a manager ("" for none yet), else the tracker's own."""
+        if self.pmActive:
+            return self.prismStatus.read(parent, department, task, data)
+        return normalizeStatus(data.get(TASK_KEYS["status"]))
 
     @err_catcher(name=__name__)
     def mergeRowValues(self, values, snapshot, stored, fields, label):
@@ -3053,6 +3478,18 @@ class ProductionTrackerDlg(QDialog):
         snapshot = self.getRowValues(item)
         snapshot["notes"] = copy.deepcopy(snapshot.get("notes"))
         item.setData(0, ROLE_SNAPSHOT, snapshot)
+        item.setData(0, ROLE_STOREDNOW, None)
+
+    @err_catcher(name=__name__)
+    def nothingToSave(self, item, values, snapshot, fields):
+        """True when a row has nothing to save: no field differs from its
+        baseline, and no field was changed elsewhere behind an edit that has
+        since been undone (ROLE_STOREDNOW) - that one still needs the save's
+        merge, which takes the stored value and shows it."""
+        if any(values.get(k) != snapshot.get(k) for k in fields):
+            return False
+        storedNow = item.data(0, ROLE_STOREDNOW) or {}
+        return not any(k in fields for k in storedNow)
 
     @err_catcher(name=__name__)
     def conflictMessage(self):
@@ -3077,7 +3514,7 @@ class ProductionTrackerDlg(QDialog):
         id against the same fresh copy, so a concurrent comment/reply from
         another session is never clobbered either.
 
-        Returns (savedBool, [errorStrings]).
+        Returns (whether anything was written, [errorStrings]).
         """
         entity = item.data(0, ROLE_ENTITY)
         snapshot = item.data(0, ROLE_SNAPSHOT) or {}
@@ -3093,7 +3530,7 @@ class ProductionTrackerDlg(QDialog):
         if entity.get("type") == "task":
             return self.writeTaskItem(item, entity, snapshot, values)
 
-        if all(values.get(k) == snapshot.get(k) for k in ENTITY_FIELDS + ("notes",)):
+        if self.nothingToSave(item, values, snapshot, ENTITY_FIELDS + ("notes",)):
             return (False, errors)
 
         isAsset = entity.get("type") == "asset"
@@ -3105,18 +3542,28 @@ class ProductionTrackerDlg(QDialog):
             values = self.mergeRowValues(
                 values, snapshot, stored, ENTITY_FIELDS, self.shortEntityLabel(entity)
             )
+            rangeChanged = entity.get("type") == "shot" and values["range"] != stored.get("range")
             errors.extend(self.writeShotRange(entity, values, stored))
             values["notes"] = self.processNotesForSave(
                 entity, self.notifyEntityLabel(entity), meta, values, snapshot, outbox
             )
-            meta[STATUS_KEY] = {"value": values["status"], "show": True}
-            meta[ASSIGNEE_KEY] = {"value": values["assignee"], "show": True}
-            meta[DEPT_KEY] = {"value": values["department"], "show": True}
-            meta[DUE_KEY] = {"value": values["due"], "show": True}
-            meta[NOTES_KEY] = {"value": values["notes"], "show": False}
-            if not isAsset:
-                meta[DESC_KEY] = {"value": values["desc"], "show": True}
-            self.writeEntityInfo(entity, meta, desc=values["desc"] if isAsset else None)
+            storedNotes = TrackerComments.load_notes_value(
+                (meta.get(NOTES_KEY) or {}).get("value")
+            )
+            # After the merge there may be nothing left to write (the only
+            # change was someone else's, now shown here).
+            metaChanged = values["notes"] != storedNotes or any(
+                values[k] != stored[k] for k in ENTITY_FIELDS if k != "range"
+            )
+            if metaChanged:
+                meta[STATUS_KEY] = {"value": values["status"], "show": True}
+                meta[ASSIGNEE_KEY] = {"value": values["assignee"], "show": True}
+                meta[DEPT_KEY] = {"value": values["department"], "show": True}
+                meta[DUE_KEY] = {"value": values["due"], "show": True}
+                meta[NOTES_KEY] = {"value": values["notes"], "show": False}
+                if not isAsset:
+                    meta[DESC_KEY] = {"value": values["desc"], "show": True}
+                self.writeEntityInfo(entity, meta, desc=values["desc"] if isAsset else None)
         except Exception as e:
             errors.append("%s (meta): %s" % (self.leafDisplayName(entity, False), e))
             # Not saved, so nothing was taken over from elsewhere either.
@@ -3131,7 +3578,7 @@ class ProductionTrackerDlg(QDialog):
             # old snapshot would make a retry treat this user's saved fields
             # as unsaved edits and write them over newer changes.)
             self.keepFieldUnsaved(item, "range", snapshot.get("range"))
-        return (True, errors)
+        return (bool(metaChanged or rangeChanged), errors)
 
     @err_catcher(name=__name__)
     def keepFieldUnsaved(self, item, key, storedValue):
@@ -3175,13 +3622,13 @@ class ProductionTrackerDlg(QDialog):
         shot description is patched into the metadata on its own, leaving
         the shot-mode status/assignee/etc. keys in there untouched.
 
-        Returns (savedBool, [errorStrings]).
+        Returns (whether anything was written, [errorStrings]).
         """
         entity = item.data(0, ROLE_ENTITY)
         snapshot = item.data(0, ROLE_SNAPSHOT) or {}
         values = self.getRowValues(item)
         fields = ("desc", "range")
-        if all(values.get(k) == snapshot.get(k) for k in fields):
+        if self.nothingToSave(item, values, snapshot, fields):
             return (False, [])
 
         mark = len(self._mergedExternal)
@@ -3191,8 +3638,10 @@ class ProductionTrackerDlg(QDialog):
             values = self.mergeRowValues(
                 values, snapshot, stored, fields, self.shortEntityLabel(entity)
             )
+            rangeChanged = entity.get("type") == "shot" and values["range"] != stored.get("range")
+            descChanged = values["desc"] != stored["desc"]
             errors = self.writeShotRange(entity, values, stored)
-            if values["desc"] != stored["desc"]:
+            if descChanged:
                 if entity.get("type") == "asset":
                     self.writeEntityInfo(entity, meta, desc=values["desc"])
                 else:
@@ -3207,7 +3656,7 @@ class ProductionTrackerDlg(QDialog):
         if errors:
             # Only the frame range failed; just that is retried.
             self.keepFieldUnsaved(item, "range", snapshot.get("range"))
-        return (True, errors)
+        return (bool(rangeChanged or descChanged), errors)
 
     @err_catcher(name=__name__)
     def writeTaskItem(self, item, entity, snapshot, values):
@@ -3219,10 +3668,10 @@ class ProductionTrackerDlg(QDialog):
         artist survive and comments merge instead of overwriting a
         concurrent reply.
 
-        Returns (savedBool, [errorStrings]).
+        Returns (whether anything was written, [errorStrings]).
         """
         errors = []
-        if all(values.get(k) == snapshot.get(k) for k in TASK_FIELDS + ("notes",)):
+        if self.nothingToSave(item, values, snapshot, TASK_FIELDS + ("notes",)):
             return (False, errors)
 
         parent = entity.get("parent") or {}
@@ -3232,8 +3681,27 @@ class ProductionTrackerDlg(QDialog):
         outbox = []
         mark = len(self._mergedExternal)
         try:
+            # Deleted or renamed in Prism since the row was built: writing
+            # would bring the task back (or start a stray copy of it).
+            folder = self.tasks.taskFolder(parent, department, task)
+            if not folder or not os.path.isdir(folder):
+                self._taskChangesPending = True
+                raise RuntimeError(
+                    "no longer exists in Prism (deleted or renamed elsewhere), so "
+                    "this change was not saved"
+                )
+            if values.get("status") != snapshot.get("status"):
+                self.checkStatusSourceUnchanged()
             remote = self.tasks.readFresh(parent, department, task)
-            stored = self.taskFieldValues(remote)
+            stored = self.taskFieldValues(remote, parent, department, task)
+            if self.pmActive and not self.prismStatus.readOnly():
+                # Read again so a status that can't be read (a manager's
+                # server unreachable) stops the save rather than reading
+                # as a status cleared by someone else. Where statuses are
+                # read-only the row can't change one, so other fields save.
+                stored["status"] = self.prismStatus.read(
+                    parent, department, task, remote, strict=True
+                )
             values = self.mergeRowValues(
                 values, snapshot, stored, TASK_FIELDS, self.shortEntityLabel(entity)
             )
@@ -3249,14 +3717,25 @@ class ProductionTrackerDlg(QDialog):
                 entity, self.notifyEntityLabel(entity), remoteMeta, values, snapshot, outbox
             )
 
+            # A status from Prism's Project Management is set through it (see
+            # TrackerPrismStatus), not stored as the tracker's own.
+            prismStatus = self.pmActive
             changes = {
-                TASK_KEYS[k]: values[k] for k in TASK_FIELDS if values[k] != stored[k]
+                TASK_KEYS[k]: values[k]
+                for k in TASK_FIELDS
+                if values[k] != stored[k] and not (prismStatus and k == "status")
             }
             if values["notes"] != TrackerComments.load_notes_value(remoteNotes):
                 changes[TASK_KEYS["notes"]] = values["notes"]
+            wrote = False
             if changes:
                 self.tasks.write(parent, department, task, changes)
                 self.markTaskFileSeen(parent, department, task)
+                wrote = True
+            if prismStatus and values["status"] != stored["status"]:
+                self.prismStatus.write(parent, department, task, values["status"])
+                self.markTaskFileSeen(parent, department, task)
+                wrote = True
         except Exception as e:
             errors.append("%s / %s: %s" % (department, task, e))
             del self._mergedExternal[mark:]
@@ -3265,7 +3744,26 @@ class ProductionTrackerDlg(QDialog):
         self.sendNotifications(outbox)
         self.applySavedValues(item, values)
         self.refreshRollupFor(item)
-        return (True, errors)
+        return (wrote, errors)
+
+    def checkStatusSourceUnchanged(self):
+        """Before saving a task's status: raise if the project has started
+        or stopped using a Project Management manager since this window was
+        built, so the status isn't written to the list no longer in use.
+        The rebuild that follows carries the edit over (carryStatusEdits).
+        Not wrapped in err_catcher, which would swallow the error."""
+        settings = self.prismStatus.projectSettings()
+        if settings is None:
+            return  # unreadable for a moment; go by what was read last
+        manager = settings.get("manager")
+        manager = manager if isinstance(manager, str) and manager not in ("", "None") else ""
+        if manager != (self.prismStatus.manager if self.pmActive else ""):
+            self._taskChangesPending = True
+            raise RuntimeError(
+                "task statuses now come from %s; the tracker is updating, and "
+                "the status is saved after that"
+                % ("Prism's Project Management (%s)" % manager if manager else "the tracker")
+            )
 
     # ------------------------------------------------------------ add task --
     @contextlib.contextmanager
@@ -3329,6 +3827,7 @@ class ProductionTrackerDlg(QDialog):
                 "Created %d task(s) in %.1fs  (Prism: %.1fs, tracker update: %.1fs)"
                 % (created, time.time() - start, prismSecs, time.time() - start - prismSecs)
             )
+            self.appendEditsNotKept()
         if errors:
             self.core.popup(
                 "Created %d task(s). These failed:\n\n%s"
@@ -3346,6 +3845,8 @@ class ProductionTrackerDlg(QDialog):
         super(ProductionTrackerDlg, self).showEvent(event)
         if getattr(self, "syncTimer", None) and not self.syncTimer.isActive():
             self.syncTimer.start()
+        # The first refresh runs before the window is shown, too early to ask.
+        QTimer.singleShot(0, self.checkStatusSource)
 
     @err_catcher(name=__name__)
     def hideEvent(self, event):
@@ -3611,7 +4112,7 @@ class ProductionTrackerDlg(QDialog):
             deptNode.setExpanded(True)
 
     @err_catcher(name=__name__)
-    def rebuildTaskRows(self, entity):
+    def rebuildTaskRows(self, entity, deleted=()):
         """Re-read one shot/asset's departments and tasks after adding or
         deleting some, instead of rebuilding the whole tree.
 
@@ -3619,6 +4120,9 @@ class ProductionTrackerDlg(QDialog):
         the project, so its cost grows with the project; this only touches
         the one entity that changed. Unsaved edits elsewhere are untouched,
         and ones in this entity's rows are put back as a refresh would.
+
+        deleted: entity keys of task rows this window just deleted, whose
+        unsaved edits are dropped rather than reported as lost.
         """
         key = self.entityKey(entity)
         rollup = None
@@ -3631,6 +4135,12 @@ class ProductionTrackerDlg(QDialog):
             return
 
         state = self.captureTreeState()
+        if state:
+            gone = set(deleted)
+            for part in ("dirty", "base"):
+                state[part] = dict(
+                    (k, v) for k, v in state.get(part, {}).items() if k not in gone
+                )
         entity = rollup.data(0, ROLE_ENTITY)
 
         # Forget the old rows' watched paths: a deleted task's file would
@@ -3642,6 +4152,14 @@ class ProductionTrackerDlg(QDialog):
             for path in list(self._taskWatch):
                 if os.path.normcase(path).startswith(prefix):
                     del self._taskWatch[path]
+                    # The rows are read again below, through Prism's cache:
+                    # without this a sibling task changed elsewhere since the
+                    # last refresh shows its old values, and as its new mtime
+                    # is recorded at the same time, nothing corrects it.
+                    try:
+                        self.core.configs.clearCache(path)
+                    except Exception:
+                        pass
 
         self._building = True
         try:
@@ -3741,8 +4259,8 @@ class ProductionTrackerDlg(QDialog):
         )
         self.tree.setItemWidget(item, COL_ASSIGNEE, self.wrapCell(assigneeCombo))
 
-        status = normalizeStatus(data.get(TASK_KEYS["status"]))
-        statusCombo = self.makeStatusCombo(status)
+        status = self.taskStatusValue(data, entity, department, task)
+        statusCombo = self.makeStatusCombo(status, prism=self.pmActive)
         statusCombo.currentTextChanged.connect(
             lambda _t, it=item: self.onTaskRowChanged(it)
         )
@@ -3828,7 +4346,7 @@ class ProductionTrackerDlg(QDialog):
         dues = []
         for row in rows:
             values = self.getRowValues(row)
-            if values.get("status") == STATUS_COMPLETED:
+            if self.isDoneStatus(values.get("status"), self.prismStatusRow(row)):
                 done += 1
             elif values.get("due"):
                 dues.append(values["due"])
@@ -3894,28 +4412,61 @@ class ProductionTrackerDlg(QDialog):
         return entity.get("_leafName") or (entity.get("asset_path") or "").split("/")[-1]
 
     @err_catcher(name=__name__)
-    def makeStatusCombo(self, current):
+    def makeStatusCombo(self, current, prism=False):
+        """The Status dropdown of a row.
+
+        prism: a task row whose status is Prism's (see prismStatusRow). It
+        offers the project's task statuses, and a task Prism has no status
+        for yet shows "No status" rather than one being made up for it.
+        """
         cb = NoScrollComboBox()
-        names = list(STATUSES)
+        names = self.statusChoices(prism)
+        if not prism:
+            current = normalizeStatus(current)
         # As with departments: keep a status that isn't one of ours instead
         # of showing (and later saving) it as "Not started".
-        current = normalizeStatus(current)
-        if current not in names:
+        if current and current not in names:
             names.append(current)
         cb.addItems(names)
-        cb.setCurrentText(current)
+        if hasattr(cb, "setPlaceholderText"):
+            cb.setPlaceholderText("No status")
+        self.setStatusComboValue(cb, current)
 
         def style(text):
-            color = STATUS_COLORS.get(text, NEUTRAL_COLOR)
+            color = QColor(self.statusColor(text, prism) if text else NEUTRAL_COLOR)
+            # Prism's own colours include light ones; keep the text readable.
+            light = color.red() * 0.299 + color.green() * 0.587 + color.blue() * 0.114 > 160
             cb.setStyleSheet(
-                "QComboBox{border: none; border-radius: 10px; padding: 2px 10px; color: white;"
-                "background-color: %s;}" % color
+                "QComboBox{border: none; border-radius: 10px; padding: 2px 10px; color: %s;"
+                "background-color: %s;}" % ("#111827" if light else "white", color.name())
             )
 
         style(cb.currentText())
         cb.currentTextChanged.connect(style)
         cb.currentTextChanged.connect(self.scheduleAutoSave)
+
+        if prism and self.prismStatus.readOnly():
+            cb.setEnabled(False)
+            cb.setToolTip(
+                "Task statuses are kept in %s. Install Prism's Project "
+                "Management plugin on this machine to see and change them."
+                % self.prismStatus.manager
+            )
         return cb
+
+    @err_catcher(name=__name__)
+    def setStatusComboValue(self, cb, value):
+        """Show `value` in a Status dropdown, adding it if it isn't offered
+        (a status added to the project since the row was built, say); ""
+        shows the "No status" placeholder."""
+        if cb.currentText() == value and (value or cb.currentIndex() < 0):
+            return
+        if not value:
+            cb.setCurrentIndex(-1)
+            return
+        if cb.findText(value) < 0:
+            cb.addItem(value)
+        cb.setCurrentText(value)
 
     @err_catcher(name=__name__)
     def makeDepartmentCombo(self, current, departments):
@@ -4344,7 +4895,11 @@ class ProductionTrackerDlg(QDialog):
             snap = shotItem.data(0, ROLE_FXSNAPSHOT)
             if not layers and not snap:
                 continue
-            if layers != (snap or []):
+            # As nothingToSave: an edit undone after a sync still needs the
+            # merge, to take and show the value stored now.
+            if layers != (snap or []) or any(
+                c.data(0, ROLE_STOREDNOW) for c in self.fxChildren(shotItem)
+            ):
                 errs = self.writeFxLayers(shotItem)
                 if errs:
                     errors.extend(errs)
@@ -4618,11 +5173,12 @@ class ProductionTrackerDlg(QDialog):
 
     @err_catcher(name=__name__)
     def existingAssetKeys(self):
-        """{'asset/path'} already in the project or queued unsaved."""
+        """{'asset/path'} already in the project or queued unsaved, written
+        with '/' (Prism hands paths back with the OS separator)."""
         keys = set()
         for entity in self._existingEntities + self.newRows:
             if entity.get("type") == "asset":
-                keys.add((entity.get("asset_path") or "").lower())
+                keys.add((entity.get("asset_path") or "").replace("\\", "/").strip("/").lower())
         return keys
 
     @err_catcher(name=__name__)
@@ -5091,12 +5647,16 @@ class ProductionTrackerDlg(QDialog):
         def remap(key):
             if key == oldKey:
                 return newKey
+            # The same row while it is new and unsaved (see dirtyKey).
+            if isinstance(key, tuple) and key[:1] == ("new",) and key[1:] == oldKey:
+                return ("new",) + newKey
             # A task row beneath it: ("task", parentKey, department, task).
             if isinstance(key, tuple) and len(key) == 4 and key[0] == "task" and key[1] == oldKey:
                 return ("task", newKey) + key[2:]
             return key
 
         state["dirty"] = dict((remap(k), v) for k, v in state["dirty"].items())
+        state["base"] = dict((remap(k), v) for k, v in state.get("base", {}).items())
         state["selected"] = remap(state.get("selected"))
         return state
 
@@ -5107,14 +5667,17 @@ class ProductionTrackerDlg(QDialog):
             path = self.core.configs.getConfigPath(config="assetinfo")
             # The whole file is written back below, so read it fresh: Prism's
             # cache can predate other users' saves, which this would undo.
-            data = self.core.getConfig(configPath=path, allowCache=False) or {}
+            data = self.readInfoFile(path)
             if oldName in data:
                 data[newName] = data.pop(oldName)
             if "assets" in data and oldName in data["assets"]:
                 data["assets"][newName] = data["assets"].pop(oldName)
             self.core.setConfig(data=data, configPath=path, updateNestedData=False)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(
+                "Production Tracker: the data of asset '%s' was not moved to '%s': %s",
+                oldName, newName, e,
+            )
 
     @err_catcher(name=__name__)
     def deleteEntity(self, item):
@@ -5174,8 +5737,26 @@ class ProductionTrackerDlg(QDialog):
             return
 
         self.cleanupEntityMetadata(entity)
-        self.refresh(preserve=self.captureTreeState())
+        self.refresh(preserve=self.forgetEdits(self.captureTreeState(), entity))
         self.l_status.setText("Deleted %s '%s'." % (kind, name))
+
+    @err_catcher(name=__name__)
+    def forgetEdits(self, state, entity):
+        """A captureTreeState() without the unsaved edits of an entity this
+        window just deleted, or of the tasks under it - so they aren't
+        reported as lost to a deletion elsewhere."""
+        if not state:
+            return state
+        key = self.entityKey(entity)
+
+        def gone(k):
+            return k == key or (
+                isinstance(k, tuple) and len(k) == 4 and k[0] == "task" and k[1] == key
+            )
+
+        for part in ("dirty", "base"):
+            state[part] = dict((k, v) for k, v in state.get(part, {}).items() if not gone(k))
+        return state
 
     @err_catcher(name=__name__)
     def filesIn(self, folder, ignore=()):
@@ -5264,9 +5845,10 @@ class ProductionTrackerDlg(QDialog):
             self._notesItem = None
         if not self.removeFolder(folder):
             return
-        self.rebuildTaskRows(parent)
+        self.rebuildTaskRows(parent, deleted=[self.entityKey(item.data(0, ROLE_ENTITY) or {})])
         self.refreshPrismUI()
         self.l_status.setText("Deleted task '%s / %s'." % (deptLabel, task))
+        self.appendEditsNotKept()
 
     @err_catcher(name=__name__)
     def deleteDepartment(self, item):
@@ -5292,11 +5874,16 @@ class ProductionTrackerDlg(QDialog):
         if result != "Delete":
             return
 
+        taskKeys = [
+            self.entityKey(child.data(0, ROLE_ENTITY) or {})
+            for child in (item.child(i) for i in range(item.childCount()))
+        ]
         if not self.removeFolder(folder):
             return
-        self.rebuildTaskRows(entity)
+        self.rebuildTaskRows(entity, deleted=taskKeys)
         self.refreshPrismUI()
         self.l_status.setText("Deleted department '%s'." % longName)
+        self.appendEditsNotKept()
 
     @err_catcher(name=__name__)
     def cleanupEntityMetadata(self, entity):
@@ -5307,7 +5894,7 @@ class ProductionTrackerDlg(QDialog):
         try:
             if entity.get("type") == "asset":
                 path = self.core.configs.getConfigPath(config="assetinfo")
-                data = self.core.getConfig(configPath=path, allowCache=False) or {}
+                data = self.readInfoFile(path)
                 name = self.core.entities.getAssetNameFromPath(entity["asset_path"])
                 data.pop(name, None)
                 if "assets" in data:
@@ -5315,7 +5902,7 @@ class ProductionTrackerDlg(QDialog):
                 self.core.setConfig(data=data, configPath=path, updateNestedData=False)
             else:
                 path = self.core.configs.getConfigPath(config="shotinfo")
-                data = self.core.getConfig(configPath=path, allowCache=False) or {}
+                data = self.readInfoFile(path)
                 seq = entity.get("sequence", "")
                 shot = entity.get("shot", "")
                 episode = entity.get("episode", "")
@@ -5334,8 +5921,383 @@ class ProductionTrackerDlg(QDialog):
                     ranges[seq].pop(shot, None)
 
                 self.core.setConfig(data=data, configPath=path, updateNestedData=False)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(
+                "Production Tracker: leftover tracker data of a deleted entity was "
+                "not removed: %s", e
+            )
+
+    # ------------------------------------------------- Prism task statuses --
+    @err_catcher(name=__name__)
+    def checkStatusSource(self):
+        """When the project has started or stopped using Prism's Project
+        Management for task statuses: offer to carry the statuses over.
+
+        Each side's statuses stay where they are when the manager changes,
+        so turning one on starts every task at "No status", and turning it
+        off brings back the tracker's statuses as they were before. Where
+        task statuses came from is recorded in the project, so this is asked
+        once, of whoever opens the tracker first, and not again on every
+        machine. Configuration -> Copy Task Statuses does the same by hand.
+        """
+        if (
+            self._checkingSource
+            or self._busy
+            or self._syncing
+            or not self.isVisible()
+            or not self.taskMode()
+            or not getattr(self.core, "projectPath", None)
+            or self.prismStatus.readFailed
+        ):
+            return
+        # Only the copy offered below may show it; otherwise it would surface
+        # in some later, unrelated Copy Task Statuses popup.
+        dropNote = getattr(self, "_statusDropNote", None)
+        self._statusDropNote = None
+        current = self.prismStatus.manager if self.pmActive else ""
+        # Before 1.1.0 task statuses were always the tracker's own, so
+        # "never recorded" means the same as "the tracker's".
+        previous = self.settings.getStatusSource() or ""
+        if previous == current:
+            return
+        if current and self.prismStatus.readOnly():
+            # Left for a machine that can write the statuses to offer.
+            return
+        # Asked once per change and window, even if recording it below fails
+        # (a read-only config folder), so it doesn't come back every refresh.
+        asked = getattr(self, "_askedSource", set())
+        if (previous, current) in asked:
+            return
+        asked.add((previous, current))
+        self._askedSource = asked
+
+        self._checkingSource = True
+        try:
+            # Recorded before asking, so the rest of the team isn't asked too.
+            self.settings.saveStatusSource(current)
+            if (self.settings.getStatusSource() or "") != current:
+                logger.warning(
+                    "Production Tracker: could not record where task statuses come from"
+                )
+            if current and not previous:
+                answer = self.core.popupQuestion(
+                    "This project now uses Prism's Project Management (%s), so "
+                    "the tracker shows and edits Prism's task statuses from now "
+                    "on, the same ones the Project Browser shows.\n\n"
+                    "Copy the task statuses already set in the tracker across?\n\n"
+                    "Only tasks that have no Prism status yet get one, and "
+                    "nothing is deleted. This can also be done later from "
+                    "Configuration -> Copy Task Statuses." % current,
+                    title="Task statuses",
+                    buttons=["Copy Statuses", "Not Now"],
+                    parent=self,
+                )
+                if answer == "Copy Statuses":
+                    self._statusDropNote = dropNote
+                    self.copyTrackerToPrism()
+            elif previous == TrackerPrismStatus.PRISM_MANAGER and not current:
+                answer = self.core.popupQuestion(
+                    "This project no longer uses Prism's Project Management for "
+                    "task statuses, so the tracker shows its own again. They "
+                    "are as they were before Prism's were used, so they may be "
+                    "out of date.\n\n"
+                    "Copy the Prism task statuses into the tracker?\n\n"
+                    "This can also be done later from Configuration -> Copy "
+                    "Task Statuses.",
+                    title="Task statuses",
+                    buttons=["Copy Statuses", "Not Now"],
+                    parent=self,
+                )
+                if answer == "Copy Statuses":
+                    self._statusDropNote = dropNote
+                    self.copyPrismToTracker(keepEdited=True)
+        finally:
+            self._checkingSource = False
+            note = getattr(self, "_statusDropNote", None)
+            self._statusDropNote = None
+            if note and note not in self.l_status.text():
+                # Not shown by a copy result (the copy was cancelled) and the
+                # label was replaced meanwhile: add it back.
+                self.l_status.setText((self.l_status.text() + "  " + note).strip())
+
+    @err_catcher(name=__name__)
+    def onCopyStatuses(self):
+        """Configuration -> Copy Task Statuses."""
+        if not self.taskMode():
+            return
+        toPrism = self.pmActive and not self.prismStatus.readOnly()
+        buttons = (["Into Prism"] if toPrism else []) + ["Into the Tracker", "Cancel"]
+        if toPrism:
+            text = (
+                "Task statuses are Prism's (%s). Copy statuses between the "
+                "tracker and Prism:\n\n"
+                "Into Prism: the statuses set in the tracker before Prism's "
+                "were used, for tasks that have no Prism status yet.\n\n"
+                "Into the Tracker: Prism's statuses, replacing the tracker's "
+                "own. Those are only shown when the project stops using a "
+                "manager." % self.prismStatus.manager
+            )
+        else:
+            text = (
+                "Copy Prism's task statuses into the tracker, replacing its "
+                "own? Prism's are the 'status' that Prism's Project "
+                "Management stored on each task while the project used it."
+            )
+        answer = self.core.popupQuestion(
+            text, title="Copy Task Statuses", buttons=buttons, parent=self
+        )
+        self._checkingSource = True
+        try:
+            if answer == "Into Prism":
+                self.copyTrackerToPrism()
+            elif answer == "Into the Tracker":
+                self.copyPrismToTracker()
+        finally:
+            self._checkingSource = False
+
+    @err_catcher(name=__name__)
+    def projectTasks(self):
+        """(entity, department, departmentLabel, task) for every task of
+        every shot and asset in the project."""
+        found = []
+        for entity in getattr(self, "_existingEntities", None) or []:
+            for department, longName in self.tasks.departments(entity) or []:
+                for task in self.tasks.tasks(entity, department) or []:
+                    found.append((entity, department, longName, task))
+        return found
+
+    @err_catcher(name=__name__)
+    def taskLabel(self, entity, department, departmentLabel, task):
+        return self.shortEntityLabel(
+            {
+                "type": "task",
+                "parent": entity,
+                "department": department,
+                "departmentLabel": departmentLabel,
+                "task": task,
+            }
+        )
+
+    @err_catcher(name=__name__)
+    def readAllTasks(self, errors):
+        """[(entity, department, label, task, data)] for every task, read
+        fresh, with a Working dialog. Unreadable ones go to `errors`."""
+        if self.saveTimer.isActive() or self.retryTimer.isActive():
+            # Pending edits first (and ones a failed save is waiting to
+            # retry), so the copy works from what is saved.
+            self.saveTimer.stop()
+            self.retryTimer.stop()
+            self.flushAutoSave()
+        refs = self.projectTasks()
+        out = []
+        with self.working(len(refs)) as work:
+            for i, (entity, department, longName, task) in enumerate(refs):
+                label = self.taskLabel(entity, department, longName, task)
+                work.step(i, "Reading %s" % label)
+                try:
+                    data = self.tasks.readFresh(entity, department, task)
+                except Exception as e:
+                    errors.append("%s: %s" % (label, e))
+                    continue
+                out.append((entity, department, label, task, data))
+        return out
+
+    @staticmethod
+    def prismStyleName(status):
+        """A tracker status written the way Prism's statuses are ("In-review"
+        -> "In Review")."""
+        return " ".join(w[:1].upper() + w[1:] for w in status.replace("-", " ").split())
+
+    @err_catcher(name=__name__)
+    def copyTrackerToPrism(self):
+        """Give tasks without a Prism status the one set in the tracker."""
+        if not self.pmActive or self.prismStatus.readOnly():
+            return
+        errors = []
+        plan = []
+        for entity, department, label, task, data in self.readAllTasks(errors):
+            mine = data.get(STATUS_KEY)
+            if not isinstance(mine, str) or not mine.strip():
+                continue
+            try:
+                # Strict: a status that can't be read must not pass for none.
+                theirs = self.prismStatus.read(entity, department, task, data, strict=True)
+            except Exception as e:
+                errors.append("%s: %s" % (label, e))
+                continue
+            plan.append((entity, department, label, task, normalizeStatus(mine), theirs))
+
+        if not plan:
+            self.showCopyResult("No task has a status set in the tracker, so there is nothing to copy.", errors)
+            return
+
+        # Tracker statuses the project has nothing for (by default "In-review"
+        # and "Not needed"): offer to add them to the Prism list.
+        unmatched = [
+            s for s in STATUSES + sorted(set(p[4] for p in plan) - set(STATUSES))
+            if any(p[4] == s for p in plan) and not self.prismStatus.trackerToPrism(s)
+        ]
+        if unmatched and self.prismStatus.isPrism():
+            names = [self.prismStyleName(s) for s in unmatched]
+            count = sum(1 for p in plan if p[4] in unmatched)
+            answer = self.core.popupQuestion(
+                "The project's task statuses have nothing matching these "
+                "tracker statuses, used on %d task(s):\n\n%s\n\n"
+                "Add them to the project's task statuses (Project Settings -> "
+                "Project Management)? Otherwise those tasks are skipped."
+                % (count, ", ".join(unmatched)),
+                title="Task statuses",
+                buttons=["Add Them", "Skip Those Tasks", "Cancel"],
+                parent=self,
+            )
+            if answer not in ("Add Them", "Skip Those Tasks"):
+                return
+            if answer == "Add Them":
+                self.prismStatus.addStatuses(
+                    [
+                        (name, STATUS_COLORS.get(status, NEUTRAL_COLOR))
+                        for status, name in zip(unmatched, names)
+                    ]
+                )
+
+        copied = 0
+        skipped = 0
+        kept = []
+        written = set()
+        with self.working(len(plan)) as work:
+            for i, (entity, department, label, task, mine, theirs) in enumerate(plan):
+                work.step(i, "Copying %s" % label)
+                target = self.prismStatus.trackerToPrism(mine)
+                if not target:
+                    skipped += 1
+                    continue
+                try:
+                    if not theirs:
+                        # Read again right before writing: someone may have
+                        # set one in the Project Browser since the first read.
+                        data = self.tasks.readFresh(entity, department, task)
+                        theirs = self.prismStatus.read(entity, department, task, data, strict=True)
+                    if theirs:
+                        if theirs != target:
+                            kept.append("%s: Prism '%s', tracker '%s'" % (label, theirs, mine))
+                        continue
+                    self.prismStatus.write(entity, department, task, target)
+                    copied += 1
+                    written.add(("task", self.entityKey(entity), department, task))
+                except Exception as e:
+                    errors.append("%s: %s" % (label, e))
+
+        lines = ["Copied %d task status(es) into Prism." % copied]
+        if skipped:
+            lines.append("%d task(s) skipped: Prism has no matching status." % skipped)
+        if kept:
+            lines.append(
+                "%d task(s) already had a different Prism status, which was kept:\n%s"
+                % (len(kept), self.shortList(kept))
+            )
+        self._ownBulkWrite = written
+        self.refresh(preserve=self.captureTreeState())
+        self.showCopyResult("\n\n".join(lines), errors)
+
+    @err_catcher(name=__name__)
+    def copyPrismToTracker(self, keepEdited=False):
+        """Replace the tracker's own task statuses with Prism's.
+
+        keepEdited: leave out tasks with an unsaved status change (asked when
+        the project stops using a manager: a change carried over by
+        carryStatusEdits is newer than the Prism status, which never got it).
+        """
+        errors = []
+        copied = 0
+        found = 0
+        plan = []
+        keep = {}
+        if keepEdited:
+            state = self.captureTreeState() or {}
+            keep = dict(
+                (k, v["status"]) for k, v in state.get("dirty", {}).items()
+                if isinstance(k, tuple) and k[:1] == ("task",) and "status" in v
+            )
+        notCopied = []
+        for entity, department, label, task, data in self.readAllTasks(errors):
+            if self.pmActive:
+                theirs = self.prismStatus.read(entity, department, task, data)
+                abbreviation = (self.prismStatus.entry(theirs) or {}).get("abbreviation", "")
+            else:
+                # The project no longer uses a manager: what the Prism one
+                # left on the task (stored by abbreviation).
+                theirs = data.get(TrackerPrismStatus.STATUS_FIELD)
+                if isinstance(theirs, str):
+                    theirs, abbreviation = self.prismStatus.leftByPrism(theirs)
+            if not isinstance(theirs, str) or not theirs.strip():
+                continue
+            found += 1
+            target = TrackerPrismStatus.PrismStatus.prismToTracker(theirs, STATUSES, abbreviation)
+            key = ("task", self.entityKey(entity), department, task)
+            if key in keep:
+                if normalizeStatus(keep[key]) != target:
+                    notCopied.append(label)
+                continue
+            mine = data.get(STATUS_KEY)
+            if isinstance(mine, str) and normalizeStatus(mine) == target:
+                continue
+            plan.append((entity, department, label, task, target))
+
+        copiedKeys = set()
+        with self.working(len(plan)) as work:
+            for i, (entity, department, label, task, target) in enumerate(plan):
+                work.step(i, "Copying %s" % label)
+                try:
+                    self.tasks.write(entity, department, task, {STATUS_KEY: target})
+                    copied += 1
+                    copiedKeys.add(("task", self.entityKey(entity), department, task))
+                except Exception as e:
+                    errors.append("%s: %s" % (label, e))
+
+        state = self.captureTreeState()
+        if state and not self.pmActive:
+            # The rows show the tracker's statuses: what was just copied
+            # replaces a status change still waiting to be saved there,
+            # which is what the copy was asked to do.
+            for key in copiedKeys:
+                state["dirty"].get(key, {}).pop("status", None)
+                state["base"].get(key, {}).pop("status", None)
+        # With a manager active the rows show Prism's status, which this copy
+        # doesn't write: a change there was made elsewhere.
+        self._ownBulkWrite = copiedKeys if not self.pmActive else None
+        self.refresh(preserve=state)
+        if plan:
+            text = "Copied %d Prism task status(es) into the tracker." % copied
+        elif found:
+            text = "The tracker's task statuses already match Prism's."
+        else:
+            text = "No task has a Prism status, so there is nothing to copy."
+        if notCopied:
+            text += (
+                "\n\nLeft as you just changed them (their Prism status is older):\n%s"
+                % self.shortList(notCopied)
+            )
+        self.showCopyResult(text, errors)
+
+    @staticmethod
+    def shortList(lines, limit=12):
+        shown = lines[:limit]
+        if len(lines) > limit:
+            shown.append("... and %d more" % (len(lines) - limit))
+        return "\n".join(shown)
+
+    @err_catcher(name=__name__)
+    def showCopyResult(self, text, errors):
+        # The Project Browser doesn't notice the statuses changing on its own.
+        self.refreshPrismUI()
+        note = getattr(self, "_statusDropNote", None)
+        if note:
+            self._statusDropNote = None
+            text += "\n\n" + note
+        if errors:
+            logger.warning("Production Tracker: copying task statuses: %s", "; ".join(errors))
+            text += "\n\nNot copied, because of an error:\n%s" % self.shortList(errors)
+        self.core.popup(text, title="Task statuses", severity="info", parent=self)
 
     @err_catcher(name=__name__)
     def openAbout(self):
@@ -5462,6 +6424,20 @@ class ProductionTrackerDlg(QDialog):
             )
 
     @err_catcher(name=__name__)
+    def shotHasRange(self, entity):
+        """True for a shot that exists in Prism with a frame range stored."""
+        if entity.get("type") != "shot":
+            return False
+        try:
+            if not os.path.isdir(self.core.getEntityPath(entity=entity) or ""):
+                return False
+            self.core.configs.clearCache(self.entityInfoPath(entity))
+            stored = self.core.entities.getShotRange(entity)
+        except Exception:
+            return False
+        return bool(stored) and stored[0] is not None
+
+    @err_catcher(name=__name__)
     def saveAllRows(self, errors, createdNew):
         """onSave's work: create new rows in Prism and write every changed
         row. Appends to `errors`, and the entities of new rows that were
@@ -5475,6 +6451,7 @@ class ProductionTrackerDlg(QDialog):
             entity = item.data(0, ROLE_ENTITY)
             isNew = item.data(0, ROLE_ISNEW)
             isRollup = bool(item.data(0, ROLE_ROLLUP))
+            existed = False
 
             # Create the entity in Prism if it is new.
             if isNew:
@@ -5491,8 +6468,17 @@ class ProductionTrackerDlg(QDialog):
                         frameRange = [entity["_start"], entity["_end"]]
                 else:
                     createEntity["asset_path"] = entity["asset_path"]
+                if frameRange is not None and self.shotHasRange(createEntity):
+                    # Created meanwhile by someone else. Prism's create would
+                    # write this range over theirs unconditionally; leave it to
+                    # the merge below, which keeps theirs unless this row's
+                    # range was edited after it was added.
+                    frameRange = None
                 try:
-                    result = self.core.entities.createEntity(createEntity, frameRange=frameRange)
+                    # silent: the tracker says itself when one already existed.
+                    result = self.core.entities.createEntity(
+                        createEntity, frameRange=frameRange, silent=True
+                    )
                 except Exception as e:
                     result = {"error": str(e)}
                 # Prism reports a failure as an empty result or an "error"
@@ -5510,10 +6496,24 @@ class ProductionTrackerDlg(QDialog):
                     )
                     continue
                 createdNew.append(entity)
-                created += 1
+                existed = bool(result.get("existed"))
+                if not existed:
+                    created += 1
                 # The row is now a real entity; persist its fields below.
                 item.setData(0, ROLE_ENTITY, createEntity)
                 item.setData(0, ROLE_ISNEW, False)
+                if frameRange is not None:
+                    # Prism may not have stored the range (its setter refuses
+                    # while the shot info file can't be read): the stored one
+                    # becomes the baseline, so the typed range is written
+                    # below, and kept for a retry if that fails too.
+                    try:
+                        self.core.configs.clearCache(self.entityInfoPath(createEntity))
+                    except Exception:
+                        pass
+                    storedText = self.shotRangeText(createEntity, False)
+                    if storedText != "%s-%s" % tuple(frameRange):
+                        self.keepFieldUnsaved(item, "range", storedText)
 
             if isRollup:
                 ok, errs = self.writeRollupItem(item)
@@ -5522,6 +6522,19 @@ class ProductionTrackerDlg(QDialog):
             if ok:
                 updated += 1
             errors.extend(errs)
+            if existed:
+                # Created meanwhile by someone else: the row's untouched fields
+                # took their values, frame range included (see shotHasRange).
+                self._mergedExternal.append(
+                    "%s already existed in Prism; %s"
+                    % (
+                        self.shortEntityLabel(item.data(0, ROLE_ENTITY) or entity),
+                        "what you changed on the new row was saved to it, the "
+                        "rest kept its values"
+                        if ok
+                        else "its values were kept",
+                    )
+                )
 
         fxSaved, fxErrs = self.saveAllFxLayers()
         updated += fxSaved

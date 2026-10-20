@@ -36,6 +36,21 @@ from PrismUtils.Decorators import err_catcher_plugin as err_catcher
 import TrackerPrismGuards
 
 
+# Prism events (in this Prism session) after which an open tracker may show
+# something out of date. It checks for changes straight away instead of at
+# its next poll; changes made on other machines still come in by polling.
+PRISM_CHANGE_EVENTS = (
+    "onShotCreated",
+    "onAssetCreated",
+    "onAssetFolderCreated",
+    "onDepartmentCreated",
+    "onTaskCreated",
+    "onEditShotDlgSaved",
+    "postProjectSettingsSave",
+    "onProjectBrowserRefreshUI",
+)
+
+
 class Prism_ProductionTracker_Functions(object):
     def __init__(self, core, plugin):
         self.core = core
@@ -62,6 +77,9 @@ class Prism_ProductionTracker_Functions(object):
             "postInitialize", self.installGuards, plugin=self.plugin
         )
 
+        for name in PRISM_CHANGE_EVENTS:
+            self.core.registerCallback(name, self.onPrismChanged, plugin=self.plugin)
+
     # if returns true, the plugin will be loaded by Prism
     @err_catcher(name=__name__)
     def isActive(self):
@@ -70,6 +88,46 @@ class Prism_ProductionTracker_Functions(object):
     @err_catcher(name=__name__)
     def installGuards(self, *args):
         TrackerPrismGuards.install(self.core, self.plugin)
+        self.watchStatusChanges()
+
+    @err_catcher(name=__name__)
+    def onPrismChanged(self, *args, **kwargs):
+        """Something changed in this Prism session: have an open tracker
+        check for it now. Statuses set by Prism's Project Management plugin
+        come here too (see watchStatusChanges)."""
+        dlg = self.trackerDlg
+        if dlg and self.core.isObjectValid(dlg) and dlg.isVisible():
+            dlg.requestSync()
+        # Its manager may have just been switched (Project Settings saved).
+        self.watchStatusChanges()
+
+    @err_catcher(name=__name__)
+    def watchStatusChanges(self):
+        """Call onPrismChanged after Prism's Project Management plugin sets a
+        task status (the Project Browser's status menu), so an open tracker
+        shows it straight away. Wraps the plugin's public setTaskStatus and
+        its current manager's; does nothing when the plugin isn't loaded."""
+        pm = self.core.getPlugin("ProjectManagement")
+        if not pm:
+            return
+        for owner in (pm, getattr(pm, "curManager", None)):
+            orig = getattr(owner, "setTaskStatus", None) if owner is not None else None
+            if orig is None or getattr(orig, TrackerPrismGuards.GUARD_ATTR, False):
+                continue
+
+            def setTaskStatus(*args, _orig=orig, **kwargs):
+                result = _orig(*args, **kwargs)
+                try:
+                    self.onPrismChanged()
+                except Exception:
+                    pass
+                return result
+
+            setattr(setTaskStatus, TrackerPrismGuards.GUARD_ATTR, True)
+            try:
+                setattr(owner, "setTaskStatus", setTaskStatus)
+            except Exception:
+                pass
 
     @err_catcher(name=__name__)
     def onPreProjectChange(self, *args):
@@ -119,6 +177,8 @@ class Prism_ProductionTracker_Functions(object):
         import ProductionTrackerDlg
 
         parent = origin or getattr(self.core, "pb", None) or self.core.messageParent
+        # The Project Management plugin may have loaded after this one.
+        self.watchStatusChanges()
 
         if self.trackerDlg and self.core.isObjectValid(self.trackerDlg):
             # An open window is up to date and may hold edits that are still
