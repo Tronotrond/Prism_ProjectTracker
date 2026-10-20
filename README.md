@@ -20,6 +20,13 @@ changed.
 > studio works. Please try it on a copy or a test project before pointing it at
 > live work — see [Before you use it in production](#before-you-use-it-in-production).
 
+### Video introduction
+
+[![Watch the Prism Production Tracker introduction on YouTube](https://img.youtube.com/vi/PnkbHOPFF20/maxresdefault.jpg)](https://www.youtube.com/watch?v=PnkbHOPFF20)
+
+*[Prism Production Tracker: Introduction](https://www.youtube.com/watch?v=PnkbHOPFF20)
+(YouTube): installation, setup and day-to-day use.*
+
 ![The Production Tracker window, grouping a shot by its Prism departments and tasks](Screenshots/Prism_Layout.png)
 
 *Tracking a shot by its Prism departments and tasks: per-task assignees, statuses and due dates, with a threaded comment on the selected task.*
@@ -98,6 +105,9 @@ actually changed, so two people editing at once do not clobber each other.
 
 A **Production Tracker** menu appears in the Project Browser menu bar with
 **Open Tracker** and **User Management**.
+
+The [video introduction](https://www.youtube.com/watch?v=PnkbHOPFF20) walks
+through these steps.
 
 ---
 
