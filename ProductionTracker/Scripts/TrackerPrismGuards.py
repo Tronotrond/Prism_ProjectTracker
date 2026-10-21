@@ -129,6 +129,32 @@ def readFreshFile(core, path):
     return data if isinstance(data, dict) else None
 
 
+def shotInfoEntityData(core, shotInfo, entity, create=False):
+    """A shot's entry in the shot info file's data, or None when it has
+    none (made, when create is set).
+
+    Prism 2.1.4 locates it with entities.getShotInfoEntityData, which knows
+    its per-episode layout. Older Prism has no such function and keeps
+    every shot at shots -> sequence -> shot, which this reads instead.
+    """
+    get = getattr(core.entities, "getShotInfoEntityData", None)
+    if get is not None:
+        return get(shotInfo, entity, create=create)
+
+    sequence = entity.get("sequence")
+    shot = entity.get("shot")
+    if not sequence or not shot:
+        return None
+    level = shotInfo
+    for key in ("shots", sequence, shot):
+        if not isinstance(level.get(key), dict):
+            if not create:
+                return None
+            level[key] = {}
+        level = level[key]
+    return level
+
+
 def readFreshMetaData(core, entity):
     """An entity's metadata block read straight from disk, or None if the
     file can't be read (a deep copy - it is safe to modify)."""
@@ -142,7 +168,7 @@ def readFreshMetaData(core, entity):
         entry = assets.get(name) if isinstance(assets.get(name), dict) else {}
         block = entry.get("metadata")
     else:
-        block = (core.entities.getShotInfoEntityData(data, entity) or {}).get("metadata")
+        block = (shotInfoEntityData(core, data, entity) or {}).get("metadata")
     return copy.deepcopy(block) if isinstance(block, dict) else {}
 
 

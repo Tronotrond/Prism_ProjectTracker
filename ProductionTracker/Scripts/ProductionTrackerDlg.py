@@ -58,6 +58,7 @@ from PrismUtils.Decorators import err_catcher_plugin as err_catcher
 import Prism_ProductionTracker_Variables as PluginVars
 import TrackerSettings
 import TrackerTasks
+import TrackerPrismGuards
 import TrackerPrismStatus
 import TrackerTeam
 import TrackerComments
@@ -3349,7 +3350,7 @@ class ProductionTrackerDlg(QDialog):
             meta = dictOrEmpty(dictOrEmpty(dictOrEmpty(data.get("assets")).get(name)).get("metadata"))
             desc = dictOrEmpty(data.get(name)).get("description")
         else:
-            shotData = self.core.entities.getShotInfoEntityData(data, entity)
+            shotData = TrackerPrismGuards.shotInfoEntityData(self.core, data, entity)
             meta = dictOrEmpty(dictOrEmpty(shotData).get("metadata"))
             desc = dictOrEmpty(meta.get(DESC_KEY)).get("value")
         return copy.deepcopy(meta), desc if isinstance(desc, str) else ""
@@ -3384,7 +3385,7 @@ class ProductionTrackerDlg(QDialog):
                     data[name] = {}
                 data[name]["description"] = desc
         else:
-            shotData = self.core.entities.getShotInfoEntityData(data, entity, create=True)
+            shotData = TrackerPrismGuards.shotInfoEntityData(self.core, data, entity, create=True)
             if shotData is None:
                 raise RuntimeError("no place for this shot in the shot info file")
             shotData["metadata"] = meta
