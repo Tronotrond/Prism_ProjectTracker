@@ -5590,6 +5590,7 @@ class ProductionTrackerDlg(QDialog):
                 # predate other users' saves to other shots, so clear it first.
                 self.core.configs.clearCache()
                 oldFolder = self.entityFolderPath(entity)
+                oldRange = TrackerPrismGuards.storedRange(self.core, entity)
                 self.core.entities.renameShot(entity, newShot)
             except Exception as e:
                 self.core.popup("Could not rename shot:\n\n%s" % e, parent=self)
@@ -5603,6 +5604,15 @@ class ProductionTrackerDlg(QDialog):
             ):
                 self.refresh(preserve=state)
                 return
+            if oldRange and not TrackerPrismGuards.storedRange(self.core, newShot):
+                # Prism 2.1.1-2.1.3 don't move the frame range of a shot in
+                # a project with episodes (it is stored per episode there).
+                try:
+                    self.core.entities.setShotRange(newShot, oldRange[0], oldRange[1])
+                except Exception as e:
+                    logger.warning(
+                        "Production Tracker: the renamed shot's frame range was not kept: %s", e
+                    )
         else:
             oldPath = self.entityFolderPath(entity)
             if not oldPath or not os.path.exists(oldPath):
@@ -5908,11 +5918,17 @@ class ProductionTrackerDlg(QDialog):
                 shot = entity.get("shot", "")
                 episode = entity.get("episode", "")
 
-                # "shots" is always keyed by sequence, but Prism nests
-                # "shotRanges" under the episode when a project uses them, so
-                # the range would otherwise be left behind as an orphan.
-                if "shots" in data and seq in data["shots"]:
-                    data["shots"][seq].pop(shot, None)
+                # Prism 2.1.4 keeps the shot info of episode projects made
+                # with it per episode (and still reads the older entry), and
+                # nests "shotRanges" under the episode when a project uses
+                # them, so either would otherwise be left behind as an orphan.
+                shots = data.get("shots") if isinstance(data.get("shots"), dict) else {}
+                if episode and TrackerPrismGuards.useEpisodicShotInfo(self.core):
+                    perEpisode = TrackerPrismGuards.nestedEntry(shots, (episode, seq))
+                    if perEpisode is not None:
+                        perEpisode.pop(shot, None)
+                if isinstance(shots.get(seq), dict):
+                    shots[seq].pop(shot, None)
 
                 ranges = data.get("shotRanges") or {}
                 if episode and episode in ranges:

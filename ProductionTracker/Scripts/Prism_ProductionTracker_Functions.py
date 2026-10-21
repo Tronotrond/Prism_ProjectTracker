@@ -25,6 +25,7 @@
 ####################################################
 
 
+import logging
 import os
 
 from qtpy.QtCore import *
@@ -34,6 +35,9 @@ from qtpy.QtWidgets import *
 from PrismUtils.Decorators import err_catcher_plugin as err_catcher
 
 import TrackerPrismGuards
+
+
+logger = logging.getLogger(__name__)
 
 
 # Prism events (in this Prism session) after which an open tracker may show
@@ -89,6 +93,30 @@ class Prism_ProductionTracker_Functions(object):
     def installGuards(self, *args):
         TrackerPrismGuards.install(self.core, self.plugin)
         self.watchStatusChanges()
+        self.watchProjectChange()
+
+    @err_catcher(name=__name__)
+    def watchProjectChange(self):
+        """Prism before 2.1.4 has no onPreProjectChange event: there, run
+        onPreProjectChange when a project change starts, so an open tracker
+        saves its pending edits into the project they belong to and closes."""
+        try:
+            hasEvent = self.core.compareVersions(self.core.version, "v2.1.4") != "lower"
+        except Exception:
+            hasEvent = True
+        projects = getattr(self.core, "projects", None)
+        orig = getattr(projects, "changeProject", None)
+        if hasEvent or orig is None or TrackerPrismGuards.isGuarded(self.core, orig):
+            return
+
+        def changeProject(*args, _orig=orig, **kwargs):
+            try:
+                self.onPreProjectChange()
+            except Exception as e:
+                logger.warning("Production Tracker: could not close before the project change: %s", e)
+            return _orig(*args, **kwargs)
+
+        TrackerPrismGuards.wrapMethod(projects, "changeProject", changeProject)
 
     @err_catcher(name=__name__)
     def onPrismChanged(self, *args, **kwargs):

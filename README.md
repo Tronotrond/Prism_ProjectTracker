@@ -1,6 +1,6 @@
 # Production Tracker
 
-[![Version](https://img.shields.io/badge/version-v1.1.2-22c55e.svg)](#version-history)
+[![Version](https://img.shields.io/badge/version-v1.1.3-22c55e.svg)](#version-history)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 [![Prism Pipeline](https://img.shields.io/badge/Prism%20Pipeline-2.x-6366f1.svg)](https://prism-pipeline.com)
 [![Buy Me A Coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-5F7FFF.svg?logo=buymeacoffee&logoColor=white)](https://www.buymeacoffee.com/tronotrond)
@@ -12,7 +12,7 @@ status, assignee, department, frame range, due date — plus threaded comments
 with to-dos, @mentions and reminder subscriptions. Everything is stored in the
 project itself, so there is no server to run and no database to maintain.
 
-**Latest version: v1.1.2** — see [Version history](#version-history) for what
+**Latest version: v1.1.3** — see [Version history](#version-history) for what
 changed.
 
 > **Status:** used in production here, but this is a personal project rather
@@ -93,7 +93,7 @@ actually changed, so two people editing at once do not clobber each other.
 
 ## Requirements
 
-- Prism Pipeline 2.x (developed against **2.1.3**)
+- Prism Pipeline 2.1.x (developed against **2.1.4**, also tested on **2.1.3**)
 - No third-party Python packages — only Prism's own modules and `qtpy`
 
 ---
@@ -443,9 +443,9 @@ What has actually been exercised:
 
 | | |
 | --- | --- |
-| **Tested against** | Prism 2.1.3 on Windows, projects without episodes, nested asset folders, custom department and task names |
+| **Tested against** | Prism 2.1.4 and 2.1.3 on Windows, projects without episodes, nested asset folders, custom department and task names |
 | **Written for but not yet proven in a real project** | episode-based projects — the logic is covered by tests against stubbed Prism responses, not by a real episode project |
-| **Not verified at all** | other Prism 2.x versions, macOS and Linux, Prism 1 compatibility mode, projects using Prism's local-files feature |
+| **Not verified at all** | Prism 2.1.0-2.1.2 and 2.0, Prism's Studio plugin (only a stand-in for it), macOS and Linux, Prism 1 compatibility mode, projects using Prism's local-files feature |
 
 If something breaks, or your project is laid out in a way the tracker gets
 wrong, please open an issue with your Prism version and how the project is
@@ -455,7 +455,25 @@ organised — that is the most useful thing you can send.
 
 ## Version history
 
-### v1.1.2 (latest)
+### v1.1.3 (latest)
+
+Checked against the Prism 2.1.3 source and tested on a Prism 2.1.3 core.
+
+- **Fixed:** on Prism before 2.1.4, switching project while the tracker was
+  open didn't save and close it first (Prism only announces a project change
+  from 2.1.4). Edits still waiting to be saved could be lost, or saved into
+  the project being switched to. The tracker now saves and closes first on
+  those versions too.
+- **Fixed:** in episode projects created with Prism 2.1.4, which keeps shot
+  data per episode, the tracker on an older Prism read and wrote a different
+  entry than 2.1.4 users. It now follows 2.1.4's layout there.
+- **Fixed:** deleting a shot in the tracker left its tracker data behind in
+  episode projects created with Prism 2.1.4, so a new shot with the same name
+  came back with the old status, assignee and comments.
+- **Fixed:** renaming a shot in an episode project on Prism 2.1.1-2.1.3 lost
+  its frame range (Prism doesn't move it there). The tracker now keeps it.
+
+### v1.1.2
 
 - **Fixed:** on Prism versions before 2.1.4, saving any shot field
   (description, shot metadata) failed with *"'ProjectEntities' object has no

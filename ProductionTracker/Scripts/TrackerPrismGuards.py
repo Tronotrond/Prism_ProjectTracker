@@ -129,13 +129,42 @@ def readFreshFile(core, path):
     return data if isinstance(data, dict) else None
 
 
+def useEpisodicShotInfo(core):
+    """True when the project keeps shot info per episode (shots -> episode
+    -> sequence -> shot): projects with episodes made with Prism 2.1.4 or
+    later. Prism before 2.1.4 doesn't know this layout and asks here, so
+    the tracker still finds shots where 2.1.4 users store them."""
+    check = getattr(core.entities, "useEpisodicShotInfo", None)
+    try:
+        if check is not None:
+            return bool(check())
+        return bool(core.projects.getUseEpisodes()) and core.compareVersions(
+            getattr(core, "projectVersion", "") or "v0", "v2.1.4"
+        ) != "lower"
+    except Exception:
+        return False
+
+
+def nestedEntry(data, keys, create=False):
+    """data[k1][k2]... (a dict), or None; made along the way if create."""
+    level = data
+    for key in keys:
+        if not isinstance(level.get(key), dict):
+            if not create:
+                return None
+            level[key] = {}
+        level = level[key]
+    return level
+
+
 def shotInfoEntityData(core, shotInfo, entity, create=False):
     """A shot's entry in the shot info file's data, or None when it has
     none (made, when create is set).
 
-    Prism 2.1.4 locates it with entities.getShotInfoEntityData, which knows
-    its per-episode layout. Older Prism has no such function and keeps
-    every shot at shots -> sequence -> shot, which this reads instead.
+    Prism 2.1.4 locates it with entities.getShotInfoEntityData. Older Prism
+    has no such function and keeps every shot at shots -> sequence -> shot;
+    this does what 2.1.4's does instead, so it also finds shots of episode
+    projects that 2.1.4 users store per episode.
     """
     get = getattr(core.entities, "getShotInfoEntityData", None)
     if get is not None:
@@ -145,14 +174,13 @@ def shotInfoEntityData(core, shotInfo, entity, create=False):
     shot = entity.get("shot")
     if not sequence or not shot:
         return None
-    level = shotInfo
-    for key in ("shots", sequence, shot):
-        if not isinstance(level.get(key), dict):
-            if not create:
-                return None
-            level[key] = {}
-        level = level[key]
-    return level
+    episode = entity.get("episode")
+    if episode and useEpisodicShotInfo(core):
+        found = nestedEntry(shotInfo, ("shots", episode, sequence, shot), create)
+        if found is not None or create:
+            return found
+        # Stored before the project was upgraded to 2.1.4.
+    return nestedEntry(shotInfo, ("shots", sequence, shot), create)
 
 
 def readFreshMetaData(core, entity):
