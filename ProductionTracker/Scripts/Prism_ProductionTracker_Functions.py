@@ -112,7 +112,7 @@ class Prism_ProductionTracker_Functions(object):
             return
         for owner in (pm, getattr(pm, "curManager", None)):
             orig = getattr(owner, "setTaskStatus", None) if owner is not None else None
-            if orig is None or getattr(orig, TrackerPrismGuards.GUARD_ATTR, False):
+            if orig is None or TrackerPrismGuards.isGuarded(self.core, orig):
                 continue
 
             def setTaskStatus(*args, _orig=orig, **kwargs):
@@ -123,9 +123,8 @@ class Prism_ProductionTracker_Functions(object):
                     pass
                 return result
 
-            setattr(setTaskStatus, TrackerPrismGuards.GUARD_ATTR, True)
             try:
-                setattr(owner, "setTaskStatus", setTaskStatus)
+                TrackerPrismGuards.wrapMethod(owner, "setTaskStatus", setTaskStatus)
             except Exception:
                 pass
 

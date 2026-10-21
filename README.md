@@ -1,6 +1,6 @@
 # Production Tracker
 
-[![Version](https://img.shields.io/badge/version-v1.1.0-22c55e.svg)](#version-history)
+[![Version](https://img.shields.io/badge/version-v1.1.1-22c55e.svg)](#version-history)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 [![Prism Pipeline](https://img.shields.io/badge/Prism%20Pipeline-2.x-6366f1.svg)](https://prism-pipeline.com)
 [![Buy Me A Coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-5F7FFF.svg?logo=buymeacoffee&logoColor=white)](https://www.buymeacoffee.com/tronotrond)
@@ -12,7 +12,7 @@ status, assignee, department, frame range, due date — plus threaded comments
 with to-dos, @mentions and reminder subscriptions. Everything is stored in the
 project itself, so there is no server to run and no database to maintain.
 
-**Latest version: v1.1.0** — see [Version history](#version-history) for what
+**Latest version: v1.1.1** — see [Version history](#version-history) for what
 changed.
 
 > **Status:** used in production here, but this is a personal project rather
@@ -455,7 +455,19 @@ organised — that is the most useful thing you can send.
 
 ## Version history
 
-### v1.1.0 (latest)
+### v1.1.1 (latest)
+
+- **Fixed:** with Prism's **Studio** plugin (or any other plugin that patches
+  the same Prism functions) loaded, v1.1.0 could pop up *"Function
+  TrackerPrismGuards.createAsset is already monkeypatched and cannot get
+  monkeypatched again by plugin Studio"*, typically when launching a DCC such
+  as Nuke. Prism lets only one plugin patch a function, and the tracker's
+  safety guards had taken the slot first, so the other plugin's patch was
+  not installed in that session. The guards now step aside: a plugin that
+  patches the same function afterwards wraps the guard and both work, and
+  one that patched it first keeps its patch.
+
+### v1.1.0
 
 Works together with Prism's own **Project Management** plugin.
 

@@ -72,6 +72,7 @@
 import copy
 import logging
 import os
+import types
 
 
 logger = logging.getLogger(__name__)
@@ -181,19 +182,60 @@ def plainText(text):
         return text or ""
 
 
+def wrapMethod(owner, name, new):
+    """Put new in place of owner's method name, as a method of owner.
+
+    Not through Prism's monkeyPatch, which allows one patch per function: a
+    plugin that loads after the tracker (Prism's Studio plugin, say) and
+    patches the same function would be refused, with an "already
+    monkeypatched" popup, and lose its patch. As a method of owner the guard
+    looks to Prism like the function it replaced, so such a plugin's patch
+    wraps the guard and both run.
+    """
+
+    def method(self, *args, **kwargs):
+        return new(*args, **kwargs)
+
+    method.__name__ = name
+    method.__qualname__ = "%s.%s" % (type(owner).__name__, name)
+    setattr(method, GUARD_ATTR, True)
+    setattr(owner, name, types.MethodType(method, owner))
+
+
+def isGuarded(core, function):
+    """True when function is a tracker guard, or another plugin's patch
+    wrapping one (so the guard is installed already)."""
+    seen = 0
+    while function is not None and seen < 20:
+        if getattr(function, GUARD_ATTR, False):
+            return True
+        try:
+            patch = core.plugins.getFunctionPatch(function)
+        except Exception:
+            patch = None
+        function = patch.get("orig") if isinstance(patch, dict) else None
+        seen += 1
+    return False
+
+
 def patchEntities(core, plugin, orig, new):
-    """Replace a core.entities function through Prism's monkeyPatch, and say
-    so if it didn't take: Prism skips a function another plugin has already
-    patched, and quiet=True keeps that from popping up."""
+    """Replace a core.entities function with a guard (see wrapMethod).
+
+    A function another plugin has patched already is left alone and its
+    guard isn't installed: Prism keeps track of that plugin's patch by the
+    function it put there, which must stay in place."""
     name = orig.__name__
-    setattr(new, GUARD_ATTR, True)
-    new.__name__ = name
-    core.plugins.monkeyPatch(orig, new, plugin, quiet=True)
-    if getattr(core.entities, name, None) is not new:
-        logger.warning(
-            "Production Tracker: %s is already patched by another plugin, so the "
+    try:
+        patchedByOther = core.plugins.isFunctionMonkeyPatched(orig)
+    except Exception:
+        patchedByOther = False
+    if patchedByOther:
+        logger.info(
+            "Production Tracker: %s is patched by another plugin, so the "
             "tracker's guard for it is not installed", name
         )
+        return
+    wrapMethod(core.entities, name, new)
 
 
 def popup(core, text):
@@ -264,7 +306,7 @@ def guardMetaDataWidget(core, plugin=None):
 def guardSetAssetDescription(core, plugin=None):
     entities = core.entities
     orig = entities.setAssetDescription
-    if getattr(orig, GUARD_ATTR, False):
+    if isGuarded(core, orig):
         return
 
     def setAssetDescription(assetName, description):
@@ -352,7 +394,7 @@ def guardShotRenames(core, plugin=None):
     for name in ("renameShot", "renameSequence", "renameEpisode"):
         try:
             orig = getattr(entities, name)
-            if getattr(orig, GUARD_ATTR, False):
+            if isGuarded(core, orig):
                 continue
 
             def wrapper(*args, _orig=orig, **kwargs):
@@ -464,7 +506,7 @@ def storedRange(core, entity):
 def guardSetShotRange(core, plugin=None):
     entities = core.entities
     orig = entities.setShotRange
-    if getattr(orig, GUARD_ATTR, False):
+    if isGuarded(core, orig):
         return
 
     def setShotRange(entity, start, end):
@@ -504,7 +546,7 @@ def guardCreateEntities(core, plugin=None):
         return stored
 
     origShot = entities.createShot
-    if not getattr(origShot, GUARD_ATTR, False):
+    if not isGuarded(core, origShot):
 
         def createShot(entity, frameRange=None, preview=None, metaData=None):
             try:
@@ -521,7 +563,7 @@ def guardCreateEntities(core, plugin=None):
         patchEntities(core, plugin, origShot, createShot)
 
     origAsset = entities.createAsset
-    if not getattr(origAsset, GUARD_ATTR, False):
+    if not isGuarded(core, origAsset):
 
         def createAsset(entity, description=None, preview=None, metaData=None, dialog=None):
             if metaData:
