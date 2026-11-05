@@ -48,7 +48,10 @@
 #
 # 4. entities.renameShot / renameSequence / renameEpisode. They rewrite
 #    whole sections of the shot info file from Prism's cache. Guarded, the
-#    cache is cleared first so they work from the file as it is now.
+#    cache is cleared first so they work from the file as it is now. In a
+#    project with episodes, the tracker's per-episode shot data moves along
+#    with them, and before them and entities.deleteShot the shots of other
+#    episodes with the names touched keep what they show (TrackerEpisodeShots).
 #
 # 5. The Edit Shot dialog's frame range. It is filled when the dialog opens
 #    (from Prism's cache) and written back on Save whether or not it was
@@ -64,7 +67,15 @@
 #    meanwhile). Prism writes the dialog's frame range over the stored one
 #    and replaces the whole metadata block with the dialog's rows, wiping
 #    the tracker's fields. Guarded, a stored range is kept and the rows are
-#    added to the stored metadata.
+#    added to the stored metadata. A shot that is really new, in a project
+#    with episodes, is recorded as new for the tracker (TrackerEpisodeShots),
+#    so it never shows another episode's data.
+#
+# 8. entities.setMetaData, in a project with episodes made before Prism
+#    2.1.4. Prism writes an episode shot's metadata to the entry every
+#    episode's shot of that name shares, which the tracker doesn't read for
+#    a shot that has its own. Guarded, the values the call changes are
+#    added to the shot's own entry as well (TrackerEpisodeShots).
 #
 ####################################################
 
@@ -94,6 +105,7 @@ def install(core, plugin=None):
         guardEditShot,
         guardCreateEntities,
         guardSetShotRange,
+        guardSetMetaData,
     ):
         try:
             guard(core, plugin)
@@ -196,6 +208,24 @@ def readFreshMetaData(core, entity):
         entry = assets.get(name) if isinstance(assets.get(name), dict) else {}
         block = entry.get("metadata")
     else:
+        import TrackerEpisodeShots
+
+        if (
+            getattr(core.entities, "getShotInfoEntityData", None) is not None
+            and TrackerEpisodeShots.applies(core, entity)
+            and not TrackerEpisodeShots.keepsOwnFile(core)
+        ):
+            # Prism 2.1.4 keeps this shot per episode, and its lookup falls
+            # back to an entry other episodes' shots of the same name share;
+            # writing that back would copy their data into this shot's own
+            # entry. The shot's own data is used instead. (Prism before
+            # 2.1.4, or a project made with it, writes the shared entry
+            # itself, so that is what is stored there.)
+            known = TrackerEpisodeShots.folderHolders(core, entity["sequence"], entity["shot"])
+            return TrackerEpisodeShots.resolve(
+                core, entity, data, TrackerEpisodeShots.readStore(core),
+                TrackerEpisodeShots.holdersOf(entity, data, known),
+            )[0]
         block = (shotInfoEntityData(core, data, entity) or {}).get("metadata")
     return copy.deepcopy(block) if isinstance(block, dict) else {}
 
@@ -445,20 +475,34 @@ def guardAssetDialog(core, plugin=None):
 # ------------------------------------------------------- shot renames ----
 def guardShotRenames(core, plugin=None):
     entities = core.entities
-    for name in ("renameShot", "renameSequence", "renameEpisode"):
+    for name in ("renameShot", "renameSequence", "renameEpisode", "deleteShot"):
         try:
-            orig = getattr(entities, name)
-            if isGuarded(core, orig):
+            orig = getattr(entities, name, None)
+            if orig is None or isGuarded(core, orig):
                 continue
 
-            def wrapper(*args, _orig=orig, **kwargs):
+            def wrapper(*args, _orig=orig, _name=name, **kwargs):
                 # These rewrite whole sections of the shot info file from
                 # Prism's cache; make that cache the file as it is now.
                 try:
                     core.configs.clearCache(path=core.configs.getConfigPath(config="shotinfo"))
                 except Exception:
                     pass
-                return _orig(*args, **kwargs)
+                # In a project with episodes the tracker keeps shots' data
+                # apart per episode; it moves along with a rename, and the
+                # other shots of the names touched keep what they show (see
+                # TrackerEpisodeShots). Best effort, never in Prism's way.
+                after = None
+                try:
+                    import TrackerEpisodeShots
+
+                    after = TrackerEpisodeShots.beforePrismChange(core, _name, args, kwargs)
+                except Exception as e:
+                    logger.warning("Production Tracker: %s: %s", _name, e)
+                result = _orig(*args, **kwargs)
+                if after is not None:
+                    after()
+                return result
 
             patchEntities(core, plugin, orig, wrapper)
         except Exception as e:
@@ -579,6 +623,33 @@ def guardSetShotRange(core, plugin=None):
     patchEntities(core, plugin, orig, setShotRange)
 
 
+# ------------------------------------------------------ shot metadata -----
+def guardSetMetaData(core, plugin=None):
+    entities = core.entities
+    orig = entities.setMetaData
+    if isGuarded(core, orig):
+        return
+
+    def setMetaData(*args, **kwargs):
+        # In a project with episodes made before Prism 2.1.4 an episode
+        # shot's values also go to its own entry in the tracker's file (see
+        # TrackerEpisodeShots.beforeSetMetaData). Best effort, never in
+        # Prism's way.
+        after = None
+        try:
+            import TrackerEpisodeShots
+
+            after = TrackerEpisodeShots.beforeSetMetaData(core, args, kwargs)
+        except Exception as e:
+            logger.warning("Production Tracker: setMetaData: %s", e)
+        result = orig(*args, **kwargs)
+        if after is not None:
+            after()
+        return result
+
+    patchEntities(core, plugin, orig, setMetaData)
+
+
 # --------------------------------------------- creating existing entities --
 def guardCreateEntities(core, plugin=None):
     entities = core.entities
@@ -612,7 +683,25 @@ def guardCreateEntities(core, plugin=None):
                     frameRange = None
                 if metaData:
                     metaData = existingMetaData(dict(entity, type="shot"), metaData)
-            return origShot(entity, frameRange=frameRange, preview=preview, metaData=metaData)
+                return origShot(entity, frameRange=frameRange, preview=preview, metaData=metaData)
+
+            # A new shot in a project with episodes starts with only its own
+            # data, and the shots of other episodes with its name keep what
+            # they show (see TrackerEpisodeShots). Neither ever raises.
+            try:
+                import TrackerEpisodeShots
+            except Exception as e:
+                logger.warning("Production Tracker: %s", e)
+                TrackerEpisodeShots = None
+            if TrackerEpisodeShots is None:
+                return origShot(entity, frameRange=frameRange, preview=preview, metaData=metaData)
+
+            shot = dict(entity or {}, type="shot")
+            TrackerEpisodeShots.beforeCreate(core, shot, metaData)
+            try:
+                return origShot(entity, frameRange=frameRange, preview=preview, metaData=metaData)
+            finally:
+                TrackerEpisodeShots.afterCreate(core, shot)
 
         patchEntities(core, plugin, origShot, createShot)
 

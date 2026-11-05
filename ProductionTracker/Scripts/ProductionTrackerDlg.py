@@ -33,6 +33,8 @@
 # the project and is shared by all users. Saves only write rows that
 # actually changed and re-read the latest data before merging, so
 # simultaneous editing by multiple users doesn't clobber each other.
+# Shots of projects with episodes are read and written through
+# TrackerEpisodeShots, which keeps each episode's shots apart.
 #
 ####################################################
 
@@ -58,6 +60,7 @@ from PrismUtils.Decorators import err_catcher_plugin as err_catcher
 import Prism_ProductionTracker_Variables as PluginVars
 import TrackerSettings
 import TrackerTasks
+import TrackerEpisodeShots
 import TrackerPrismGuards
 import TrackerPrismStatus
 import TrackerTeam
@@ -1248,7 +1251,8 @@ class ProductionTrackerDlg(QDialog):
 
         self.setupUi()
         self.connectEvents()
-        self.refresh()
+        # Open on the rows that were open when the tracker was last closed.
+        self.refresh(preserve=self.savedExpandState())
 
         # Live sync: poll the shared config files for changes by other users.
         self.syncTimer = QTimer(self)
@@ -1265,6 +1269,13 @@ class ProductionTrackerDlg(QDialog):
 
         # Debounced persistence of the comment read-state so navigating rows
         # with the keyboard doesn't hammer the user config on disk.
+        # Which rows are open is saved shortly after it changes (and when
+        # the window closes), so the next session opens on the same view.
+        self.expandSaveTimer = QTimer(self)
+        self.expandSaveTimer.setSingleShot(True)
+        self.expandSaveTimer.setInterval(2000)
+        self.expandSaveTimer.timeout.connect(self.saveExpandState)
+
         self.readSaveTimer = QTimer(self)
         self.readSaveTimer.setSingleShot(True)
         self.readSaveTimer.setInterval(2000)
@@ -1546,6 +1557,8 @@ class ProductionTrackerDlg(QDialog):
         self.e_search.textChanged.connect(self.applyFilter)
         self.cb_filterAssignee.currentIndexChanged.connect(self.applyFilter)
         self.tree.itemSelectionChanged.connect(self.updateNotesPanel)
+        self.tree.itemExpanded.connect(self.onExpandChanged)
+        self.tree.itemCollapsed.connect(self.onExpandChanged)
         self.tree.customContextMenuRequested.connect(self.onTreeContextMenu)
         self.commentsPanel.changed.connect(self.onCommentsChanged)
         self.actClose.triggered.connect(self.close)
@@ -1715,7 +1728,7 @@ class ProductionTrackerDlg(QDialog):
 
         extras = set()
         for entity in self._existingEntities:
-            meta = self.core.entities.getMetaData(entity)
+            meta = self.storedMetaData(entity)
             val = (meta.get(ASSIGNEE_KEY, {}).get("value") or "").strip()
             if val and val.lower() not in known:
                 extras.add(val)
@@ -2069,7 +2082,7 @@ class ProductionTrackerDlg(QDialog):
             except Exception:
                 return ""
         if meta is None:
-            meta = self.core.entities.getMetaData(entity)
+            meta = self.storedMetaData(entity)
         return meta.get(DESC_KEY, {}).get("value", "") if meta else ""
 
     @err_catcher(name=__name__)
@@ -2078,6 +2091,41 @@ class ProductionTrackerDlg(QDialog):
             return bool(self.core.projects.getUseEpisodes())
         except Exception:
             return False
+
+    @err_catcher(name=__name__)
+    def isEpisodeShot(self, entity):
+        """True for a shot whose data TrackerEpisodeShots looks after: one
+        of a project with episodes, with its episode known."""
+        return TrackerEpisodeShots.applies(self.core, entity)
+
+    @err_catcher(name=__name__)
+    def knownHolders(self, entity):
+        """The episodes the last rebuild found a shot of this entity's
+        sequence and name in (see TrackerEpisodeShots.resolve)."""
+        holders = getattr(self, "_shotHolders", None) or {}
+        return set(holders.get((entity.get("sequence"), entity.get("shot")), ()))
+
+    @err_catcher(name=__name__)
+    def storedMetaData(self, entity):
+        """An entity's metadata block, for showing it.
+
+        For a shot of a project with episodes it is the tracker's own
+        resolution (see TrackerEpisodeShots), never Prism's getMetaData:
+        that falls back to an entry other episodes' shots of the same name
+        share. While the tree is built it comes from one read of the files.
+        Not a copy: don't change it.
+        """
+        if self.isEpisodeShot(entity):
+            reader = getattr(self, "_episodeReader", None)
+            if reader is not None:
+                return reader.metaData(entity)
+            try:
+                return TrackerEpisodeShots.readMetaData(
+                    self.core, entity, self.knownHolders(entity)
+                )[0]
+            except Exception:
+                return {}
+        return self.core.entities.getMetaData(entity) or {}
 
     # ------------------------------------------------------------- refresh --
     @err_catcher(name=__name__)
@@ -2129,6 +2177,8 @@ class ProductionTrackerDlg(QDialog):
             self.rebuildTree(preserve)
         finally:
             self._building = False
+            # Read once for the rows just built; later reads go to disk.
+            self._episodeReader = None
         self._lastSyncMtimes = mtimes
         # A different mode or roster shows the same stored data differently
         # (rows become rollups, assignees resolve to other names), which
@@ -2211,6 +2261,16 @@ class ProductionTrackerDlg(QDialog):
         assets = self.loadAssets()
 
         self._existingEntities = shots + assets
+
+        # Shots of projects with episodes: which episodes have each
+        # sequence/shot name (omitted shots and episodes included, though
+        # not shown), and their data, read once for every row (see
+        # TrackerEpisodeShots and storedMetaData).
+        self._shotHolders = {}
+        self._episodeReader = None
+        if self._episodes:
+            self._episodeReader = TrackerEpisodeShots.Reader(self.core, shots)
+            self._shotHolders = self._episodeReader.names
 
         # One-time migration per window: data saved before the "show" flag was
         # fixed makes Prism's own Scene Browser raise the moment such an
@@ -2448,13 +2508,19 @@ class ProductionTrackerDlg(QDialog):
     # ---------------------------------------------------------- live sync ---
     @err_catcher(name=__name__)
     def cfgPaths(self):
-        """Paths of the shared config files that hold tracker data."""
+        """Paths of the shared config files that hold tracker data: Prism's
+        shot and asset info files, and in a project with episodes the
+        tracker's own file for episode shots (see TrackerEpisodeShots)."""
         paths = []
         for cfg in ("shotinfo", "assetinfo"):
             try:
                 p = self.core.configs.getConfigPath(config=cfg)
             except Exception:
                 p = None
+            if p:
+                paths.append(p)
+        if self.usesEpisodes():
+            p = TrackerEpisodeShots.filePath(self.core)
             if p:
                 paths.append(p)
         return paths
@@ -2816,12 +2882,16 @@ class ProductionTrackerDlg(QDialog):
         def walkNodes(parent):
             for i in range(parent.childCount()):
                 child = parent.child(i)
-                if not child.data(0, ROLE_ISLEAF):
+                # A shot row with FX layers under it opens and closes too.
+                if not child.data(0, ROLE_ISLEAF) or child.childCount():
                     if child.isExpanded():
                         state["expanded"].add(self.nodePath(child))
                     walkNodes(child)
 
         walkNodes(self.tree.invisibleRootItem())
+        # With rows to look at, nothing expanded means everything was closed
+        # on purpose, not "use the default".
+        state["expandedKnown"] = self.tree.topLevelItemCount() > 0
 
         sel = self.tree.currentItem()
         if sel is not None and (sel.data(0, ROLE_ISLEAF) or sel.data(0, ROLE_ROLLUP)):
@@ -2899,11 +2969,11 @@ class ProductionTrackerDlg(QDialog):
         def walkNodes(parent):
             for i in range(parent.childCount()):
                 child = parent.child(i)
-                if not child.data(0, ROLE_ISLEAF):
+                if not child.data(0, ROLE_ISLEAF) or child.childCount():
                     child.setExpanded(self.nodePath(child) in expanded)
                     walkNodes(child)
 
-        if expanded:
+        if expanded or state.get("expandedKnown"):
             walkNodes(self.tree.invisibleRootItem())
         else:
             self.tree.expandToDepth(3 if self.taskMode() else 2)
@@ -3356,7 +3426,19 @@ class ProductionTrackerDlg(QDialog):
         return copy.deepcopy(meta), desc if isinstance(desc, str) else ""
 
     def readEntityInfo(self, entity):
-        """(metadata, description) for an entity, fresh from disk."""
+        """(metadata, description) for an entity, fresh from disk.
+
+        A shot of a project with episodes is read from its own entry, and
+        never from an entry other episodes' shots share (see
+        TrackerEpisodeShots.resolve).
+        """
+        if self.isEpisodeShot(entity):
+            meta, _source = TrackerEpisodeShots.readMetaData(
+                self.core, entity, self.knownHolders(entity)
+            )
+            desc = meta.get(DESC_KEY)
+            desc = desc.get("value") if isinstance(desc, dict) else None
+            return meta, desc if isinstance(desc, str) else ""
         return self.entityInfoFrom(self.readInfoFile(self.entityInfoPath(entity)), entity)
 
     def writeEntityInfo(self, entity, meta, desc=None):
@@ -3369,7 +3451,16 @@ class ProductionTrackerDlg(QDialog):
         Prism drops a write it can't get the file lock for without raising,
         which would otherwise show here as saved and then come back as the
         old value on the next refresh. Raises if the write didn't land.
+
+        A shot of a project with episodes is written to its own entry only:
+        the tracker's file in a project made before Prism 2.1.4, Prism's
+        per-episode entry otherwise (TrackerEpisodeShots.writeMetaData,
+        which reads back the same way).
         """
+        if self.isEpisodeShot(entity):
+            TrackerEpisodeShots.writeMetaData(self.core, entity, meta)
+            return
+
         path = self.entityInfoPath(entity)
         data = self.readInfoFile(path)
         if entity.get("type") == "asset":
@@ -3884,6 +3975,67 @@ class ProductionTrackerDlg(QDialog):
             if self.isDirty(item)
         ]
 
+    # ------------------------------------------------ remembered open rows --
+    # Which rows are expanded is kept in the Prism user config, per project
+    # and per tracker mode (the two modes lay the tree out differently), so
+    # the tracker opens on the same view next time. Per user, like the other
+    # view preferences: how someone has the tree open is their own business.
+    def expandStateKey(self):
+        """(project, mode) the open rows are remembered under, or None."""
+        projectPath = getattr(self.core, "projectPath", None)
+        if not projectPath:
+            return None
+        project = os.path.normcase(os.path.normpath(projectPath))
+        return project, "tasks" if self.taskMode() else "shots"
+
+    @err_catcher(name=__name__)
+    def onExpandChanged(self, item):
+        # Rebuilds open and close rows themselves; only the user's clicks
+        # (and expand/collapse all) are worth saving.
+        if self._building or getattr(self, "expandSaveTimer", None) is None:
+            return
+        self.expandSaveTimer.start()
+
+    def saveExpandState(self):
+        """Store which rows are open now. Never raises."""
+        try:
+            key = self.expandStateKey()
+            if key is None or self.tree.topLevelItemCount() == 0:
+                return
+            expanded = self.captureTreeState().get("expanded") or set()
+            saved = self.core.getConfig("productiontracker", "expandedRows", config="user")
+            saved = saved if isinstance(saved, dict) else {}
+            project, mode = key
+            perProject = saved.get(project) if isinstance(saved.get(project), dict) else {}
+            perProject[mode] = sorted([list(part) for part in path] for path in expanded)
+            saved[project] = perProject
+            self.core.setConfig("productiontracker", "expandedRows", val=saved, config="user")
+        except Exception as e:
+            logger.debug("Production Tracker: could not save the open rows: %s", e)
+
+    def savedExpandState(self):
+        """The rows that were open when this project was last closed in this
+        mode, as a refresh(preserve=...) state, or None to use the default."""
+        try:
+            key = self.expandStateKey()
+            if key is None:
+                return None
+            saved = self.core.getConfig("productiontracker", "expandedRows", config="user")
+            project, mode = key
+            paths = ((saved or {}).get(project) or {}).get(mode)
+            if not isinstance(paths, list):
+                return None
+            expanded = set(
+                tuple(tuple(part) for part in path)
+                for path in paths
+                if isinstance(path, list)
+                and all(isinstance(part, list) and len(part) == 2 for part in path)
+            )
+            return {"expanded": expanded, "expandedKnown": True}
+        except Exception as e:
+            logger.debug("Production Tracker: could not read the open rows: %s", e)
+            return None
+
     @err_catcher(name=__name__)
     def onWindowHidden(self):
         try:
@@ -3905,6 +4057,9 @@ class ProductionTrackerDlg(QDialog):
             # openTracker) or before a project change.
             if getattr(self, "retryTimer", None):
                 self.retryTimer.stop()
+            if getattr(self, "expandSaveTimer", None):
+                self.expandSaveTimer.stop()
+            self.saveExpandState()
             # Persist the comment read-state.
             if getattr(self, "readSaveTimer", None):
                 self.readSaveTimer.stop()
@@ -4552,7 +4707,7 @@ class ProductionTrackerDlg(QDialog):
         item.setData(0, ROLE_ENTITY, entity)
         item.setData(0, ROLE_ISNEW, isNew)
 
-        meta = {} if isNew else self.core.entities.getMetaData(entity)
+        meta = {} if isNew else self.storedMetaData(entity)
 
         # Name + thumbnail icon
         item.setText(COL_NAME, self.leafDisplayName(entity, isNew))
@@ -5578,12 +5733,30 @@ class ProductionTrackerDlg(QDialog):
             self.refresh(preserve=self.renamedState(state, oldKey, entity))
             return
 
+        moveError = None
         if isShot:
             newShot = dict(entity)
             newShot["shot"] = newName
             if self.entityFolderPath(newShot) and os.path.exists(self.entityFolderPath(newShot)):
                 self.core.popup("A shot named '%s' already exists." % newName, parent=self)
                 return
+            # In a project with episodes the tracker's own shot data moves
+            # with the rename, and the other episodes' shots of both names
+            # keep what they show (see TrackerEpisodeShots). If that can't
+            # be prepared, the shot isn't renamed, as with a delete.
+            afterRename = None
+            if self.isEpisodeShot(entity):
+                try:
+                    afterRename = TrackerEpisodeShots.prepareShotRename(
+                        self.core, entity, newShot
+                    )
+                except Exception as e:
+                    self.core.popup(
+                        "The shot '%s' was not renamed: the tracker's shot data could "
+                        "not be updated (%s). Please try again." % (curName, e),
+                        parent=self,
+                    )
+                    return
             try:
                 # renameShot handles metadata and prompts on locked files. It
                 # rewrites the shot info file from Prism's cache, which can
@@ -5591,7 +5764,10 @@ class ProductionTrackerDlg(QDialog):
                 self.core.configs.clearCache()
                 oldFolder = self.entityFolderPath(entity)
                 oldRange = TrackerPrismGuards.storedRange(self.core, entity)
-                self.core.entities.renameShot(entity, newShot)
+                # The tracker moves its entries itself (below), so the guard
+                # around Prism's renameShot leaves them alone.
+                with TrackerEpisodeShots.handledByCaller():
+                    self.core.entities.renameShot(entity, newShot)
             except Exception as e:
                 self.core.popup("Could not rename shot:\n\n%s" % e, parent=self)
                 return
@@ -5604,6 +5780,11 @@ class ProductionTrackerDlg(QDialog):
             ):
                 self.refresh(preserve=state)
                 return
+            if afterRename is not None:
+                try:
+                    afterRename()
+                except Exception as e:
+                    moveError = str(e)
             if oldRange and not TrackerPrismGuards.storedRange(self.core, newShot):
                 # Prism 2.1.1-2.1.3 don't move the frame range of a shot in
                 # a project with episodes (it is stored per episode there).
@@ -5646,6 +5827,14 @@ class ProductionTrackerDlg(QDialog):
             )
         self.refresh(preserve=self.renamedState(state, oldKey, renamed))
         self.l_status.setText("Renamed '%s' to '%s'." % (curName, newName))
+        if moveError:
+            self.core.popup(
+                "'%s' was renamed to '%s', but its tracker values could not be moved "
+                "to the new name (%s).\n\nThey are still stored under the old name, "
+                "and until then the shot may show values that are not its own. "
+                "Rename it back to '%s' and try again." % (curName, newName, moveError, curName),
+                parent=self,
+            )
 
     @err_catcher(name=__name__)
     def renamedState(self, state, oldKey, renamedEntity):
@@ -5735,6 +5924,21 @@ class ProductionTrackerDlg(QDialog):
         )
         if result != "Delete":
             return
+
+        if isShot and self.isEpisodeShot(entity):
+            # Other episodes' shots of the same name keep what they show
+            # once this one is gone (see TrackerEpisodeShots.pinShots).
+            try:
+                TrackerEpisodeShots.pinShots(
+                    self.core, [(entity.get("sequence"), entity.get("shot"))]
+                )
+            except Exception as e:
+                self.core.popup(
+                    "The shot '%s' was not deleted: the tracker's shot data could "
+                    "not be updated (%s). Please try again." % (name, e),
+                    parent=self,
+                )
+                return
 
         try:
             if folder and os.path.exists(folder):
@@ -5918,6 +6122,19 @@ class ProductionTrackerDlg(QDialog):
                 shot = entity.get("shot", "")
                 episode = entity.get("episode", "")
 
+                # In a project with episodes, the entries without an episode
+                # (shots -> sequence -> shot, and a frame range stored the
+                # same way) may be shared with another episode's shot of the
+                # same name: they are only removed when no other episode
+                # has one, so its data is never wiped.
+                others = set()
+                episodeShot = self.isEpisodeShot(entity)
+                if episodeShot:
+                    others = self.knownHolders(entity) | TrackerEpisodeShots.holdersOf(
+                        entity, data, TrackerEpisodeShots.folderHolders(self.core, seq, shot)
+                    )
+                    others.discard(episode)
+
                 # Prism 2.1.4 keeps the shot info of episode projects made
                 # with it per episode (and still reads the older entry), and
                 # nests "shotRanges" under the episode when a project uses
@@ -5927,17 +6144,21 @@ class ProductionTrackerDlg(QDialog):
                     perEpisode = TrackerPrismGuards.nestedEntry(shots, (episode, seq))
                     if perEpisode is not None:
                         perEpisode.pop(shot, None)
-                if isinstance(shots.get(seq), dict):
+                if isinstance(shots.get(seq), dict) and not others:
                     shots[seq].pop(shot, None)
 
                 ranges = data.get("shotRanges") or {}
-                if episode and episode in ranges:
-                    if seq in ranges[episode]:
-                        ranges[episode][seq].pop(shot, None)
-                elif seq in ranges:
+                if episode and isinstance(ranges.get(episode), dict) and isinstance(
+                    ranges[episode].get(seq), dict
+                ):
+                    ranges[episode][seq].pop(shot, None)
+                elif isinstance(ranges.get(seq), dict) and not others:
                     ranges[seq].pop(shot, None)
 
                 self.core.setConfig(data=data, configPath=path, updateNestedData=False)
+                if episodeShot:
+                    # The tracker's own entry for it (see TrackerEpisodeShots).
+                    TrackerEpisodeShots.removeOwn(self.core, entity)
         except Exception as e:
             logger.warning(
                 "Production Tracker: leftover tracker data of a deleted entity was "
@@ -6377,20 +6598,58 @@ class ProductionTrackerDlg(QDialog):
                 if isinstance(meta.get(key), dict) and meta[key].get("show")
             ]
 
+        # Episode shots are checked against one read of their files (see
+        # storedMetaData); outside a rebuild one is made for this pass.
+        ownReader = getattr(self, "_episodeReader", None) is None and self.usesEpisodes()
+        if ownReader:
+            shots = [e for e in self._existingEntities if e.get("type") == "shot"]
+            self._episodeReader = TrackerEpisodeShots.Reader(self.core, shots)
         fixed = 0
-        for entity in self._existingEntities:
-            # Checked against the cached copy (cheap, and left unmodified);
-            # only an entity that needs it is re-read and written.
-            try:
-                if not badKeys(self.core.entities.getMetaData(entity) or {}):
+        try:
+            for entity in self._existingEntities:
+                # Checked against the cached copy (cheap, and left unmodified);
+                # only an entity that needs it is re-read and written.
+                try:
+                    if self.isEpisodeShot(entity):
+                        fixed += self.repairEpisodeShowFlags(entity, badKeys)
+                        continue
+                    if not badKeys(self.core.entities.getMetaData(entity) or {}):
+                        continue
+                    meta, _desc = self.readEntityInfo(entity)
+                    for key in badKeys(meta):
+                        meta[key]["show"] = False
+                    self.writeEntityInfo(entity, meta)
+                    fixed += 1
+                except Exception:
                     continue
-                meta, _desc = self.readEntityInfo(entity)
+        finally:
+            if ownReader:
+                self._episodeReader = None
+        return fixed
+
+    def repairEpisodeShowFlags(self, entity, badKeys):
+        """repairShowFlags for a shot of a project with episodes. Each entry
+        is repaired where it is - the shot's own entry, and the block Prism
+        shows for it - and nothing is copied from one to the other, so a
+        block other episodes share is never written into this shot's entry
+        just by opening the tracker. The block Prism shows may be the entry
+        every episode's shot of the name shares: only its flags are changed
+        there (TrackerEpisodeShots.repairShownShowFlags). Returns how many
+        entries were written; raises on a failed read or write."""
+        fixed = 0
+        if badKeys(self.storedMetaData(entity)):
+            meta, source = TrackerEpisodeShots.readMetaData(
+                self.core, entity, self.knownHolders(entity)
+            )
+            if source == "own" and badKeys(meta):
                 for key in badKeys(meta):
                     meta[key]["show"] = False
                 self.writeEntityInfo(entity, meta)
                 fixed += 1
-            except Exception:
-                continue
+
+        if badKeys(self.core.entities.getMetaData(entity) or {}):
+            if TrackerEpisodeShots.repairShownShowFlags(self.core, entity, badKeys):
+                fixed += 1
         return fixed
 
     @err_catcher(name=__name__)
@@ -6491,6 +6750,19 @@ class ProductionTrackerDlg(QDialog):
                     # the merge below, which keeps theirs unless this row's
                     # range was edited after it was added.
                     frameRange = None
+                # A new shot in a project with episodes starts with only its
+                # own data. Prism's createShot is guarded to see to that (see
+                # TrackerPrismGuards.guardCreateEntities); when another plugin
+                # kept the guard from being installed, it is done here.
+                ownCreateHooks = (
+                    entity["type"] == "shot"
+                    and self.isEpisodeShot(createEntity)
+                    and not TrackerPrismGuards.isGuarded(
+                        self.core, self.core.entities.createShot
+                    )
+                )
+                if ownCreateHooks:
+                    TrackerEpisodeShots.beforeCreate(self.core, createEntity)
                 try:
                     # silent: the tracker says itself when one already existed.
                     result = self.core.entities.createEntity(
@@ -6498,6 +6770,12 @@ class ProductionTrackerDlg(QDialog):
                     )
                 except Exception as e:
                     result = {"error": str(e)}
+                if ownCreateHooks:
+                    TrackerEpisodeShots.afterCreate(
+                        self.core,
+                        createEntity,
+                        created=bool(result) and not result.get("error") and not result.get("existed"),
+                    )
                 # Prism reports a failure as an empty result or an "error"
                 # (which it has already shown) rather than by raising.
                 if not result or result.get("error"):

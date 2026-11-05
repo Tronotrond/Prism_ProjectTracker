@@ -1,6 +1,6 @@
 # Production Tracker
 
-[![Version](https://img.shields.io/badge/version-v1.1.3-22c55e.svg)](#version-history)
+[![Version](https://img.shields.io/badge/version-v1.1.4-22c55e.svg)](#version-history)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 [![Prism Pipeline](https://img.shields.io/badge/Prism%20Pipeline-2.x-6366f1.svg)](https://prism-pipeline.com)
 [![Buy Me A Coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-5F7FFF.svg?logo=buymeacoffee&logoColor=white)](https://www.buymeacoffee.com/tronotrond)
@@ -12,7 +12,7 @@ status, assignee, department, frame range, due date — plus threaded comments
 with to-dos, @mentions and reminder subscriptions. Everything is stored in the
 project itself, so there is no server to run and no database to maintain.
 
-**Latest version: v1.1.3** — see [Version history](#version-history) for what
+**Latest version: v1.1.4** — see [Version history](#version-history) for what
 changed.
 
 > **Status:** used in production here, but this is a personal project rather
@@ -86,7 +86,10 @@ changed.
 
 Tracker data lives in Prism's own per-entity metadata (`Shotinfo` /
 `Assetinfo`), so it travels with the project and is shared by everyone
-working on it. Saves re-read the newest data and only write the fields you
+working on it. Shots of projects with episodes made before Prism 2.1.4 are
+the exception: Prism has no separate place for each episode's shots there,
+so the tracker keeps them in its own file in the project (see
+[Where data is stored](#where-data-is-stored)). Saves re-read the newest data and only write the fields you
 actually changed, so two people editing at once do not clobber each other.
 
 ---
@@ -269,7 +272,7 @@ but each mode only shows what was entered in that mode:
 
 | Mode | Tracker fields stored in |
 | --- | --- |
-| One task per shot | the entity's Prism metadata (`Shotinfo` / `Assetinfo`) |
+| One task per shot | the entity's Prism metadata (`Shotinfo` / `Assetinfo`); for shots of episode projects made before Prism 2.1.4, the tracker's `ProductionTracker_EpisodeShots` file |
 | Prism departments and tasks | each task's own `info` file, next to the task |
 
 Nothing is deleted when you switch, and per-task data sits alongside whatever
@@ -311,6 +314,7 @@ which keeps a handed-over project readable.
 | What | Where |
 | --- | --- |
 | Status, assignee, department, dates, comments (shot mode) | Prism's per-entity metadata (`Shotinfo` / `Assetinfo`) |
+| The same fields, and the description, for shots of a project with episodes made before Prism 2.1.4 | `<pipeline>/Configs/ProductionTracker_EpisodeShots.json`, one entry per episode, sequence and shot (see [Episodes](#episodes)) |
 | The same fields per task (task mode) | `<task folder>/info.json` |
 | Task status, when the project uses Prism's Project Management | Prism's own `status` field in `<task folder>/info.json` (the status's abbreviation, e.g. `fin`, as Prism writes it), or the Kitsu/ShotGrid/ftrack server |
 | Roster, notification settings, departments | `<pipeline>/Configs/ProductionTracker.json` |
@@ -337,7 +341,8 @@ project and be visible to everyone.
 | --- | --- | --- |
 | `<pipeline>/Configs/ProductionTracker.json` | the plugin | Its own file: mode, roster, notification settings, departments, which Prism task statuses count as done. |
 | `<pipeline>/Configs/ProductionTracker_NotifyLog.json` | the plugin | Its own file: the notification send log. |
-| `<pipeline>/Shotinfo/shotInfo.*` | **Prism** | Adds `tracker_*` keys inside each shot's `metadata` block. Frame ranges go through Prism's own `setShotRange`. |
+| `<pipeline>/Configs/ProductionTracker_EpisodeShots.json` | the plugin | Its own file, only in projects with episodes: the tracker fields and description of each episode's shots, where Prism has no separate place for them (projects made before Prism 2.1.4), and a mark on each shot created since v1.1.4 so it starts empty. While saving it, a short-lived `ProductionTracker_EpisodeShots.json.trackerlock` beside it. |
+| `<pipeline>/Shotinfo/shotInfo.*` | **Prism** | Adds `tracker_*` keys inside each shot's `metadata` block, except for shots of episode projects made before Prism 2.1.4 (see [Episodes](#episodes)). Frame ranges go through Prism's own `setShotRange`. |
 | `<pipeline>/Assetinfo/assetInfo.*` | **Prism** | Adds `tracker_*` keys inside each asset's `metadata` block, and writes the asset's `description` (Prism's own field). |
 | `<task folder>/info.*` | **Prism** | Task-mode only: adds `tracker_*` keys for that task. When the project uses Prism's Project Management with the `Prism` manager, also sets the task's `status`, through that plugin where it is installed. |
 | `Documents/Prism2/Prism.json` | **Prism (per user)** | One namespaced `productiontracker` section: the row-colour preference and which comments you have read. Per user, never per project. |
@@ -392,12 +397,14 @@ statuses while copying statuses into Prism (see
   a future Prism version that starts using the file would sit alongside.
 - **Deleting an entity from the tracker** removes its entry from Prism's shot
   or asset info file, and removes the (empty) folder. That is a real deletion
-  of Prism data, and it asks first.
+  of Prism data, and it asks first. In a project with episodes, an entry
+  another episode's shot of the same name may share is left alone.
 - **Concurrency.** If two people change the *same field* of the same row, the
   later save wins and the status bar names the field that was also changed
   by someone else. The entity-info files are rewritten whole rather than
   patched in place, so two saves landing in the very same instant can still
-  lose one of them.
+  lose one of them. The tracker's own `ProductionTracker_EpisodeShots` file
+  is the exception: saves to it take turns (see [Episodes](#episodes)).
 - **Seeing other people's changes.** One-task-per-shot mode checks for them
   every few seconds. Task mode keeps each task in its own file, so it checks
   those files' timestamps in the background every 30 seconds; press Refresh
@@ -417,6 +424,52 @@ way to track them separately.
 **Episodes are supported** — sequences, shots, frame ranges and Add Shot are
 all episode aware, and two shots with the same name in different episodes are
 kept apart. See the table below for how far that has been proven.
+
+### Episodes
+
+Which Prism version a project was **made** with decides how Prism keeps its
+shot data, whatever version you run:
+
+- **Made with Prism 2.1.4 or later:** Prism keeps each episode's shots
+  separately, and the tracker writes there.
+- **Made with an older Prism:** Prism keeps every shot under its sequence and
+  shot name only, so `203 / 008 / 050` and `208 / 008 / 050` share one
+  entry. The tracker keeps each episode's shot in its own file instead
+  (`ProductionTracker_EpisodeShots`, next to `ProductionTracker.json`), and
+  never writes these shots' data into Prism's shot file.
+
+Either way, a shot that has nothing of its own in the tracker yet only shows
+the old shared entry when no other episode has a shot with the same sequence
+and name. If one does, there is no telling whose data it is, so the shot
+starts blank. A shot created in Prism (in a Prism that loads the tracker)
+starts blank too, and the other episodes' shots of that name keep what they
+showed: creating, renaming or deleting a shot never makes another one show
+different data.
+
+Prism's own Project Browser and Edit Shot dialog still read the shared
+entry in projects made before 2.1.4, so for these shots they keep showing
+the old shared values. Prism's own data is never rewritten or cleaned up for
+this.
+
+A value you change in Prism's Edit Shot dialog, or that a script sets on a
+shot after creating it, still reaches the tracker (in a Prism that loads the
+tracker): what the change sets differently from the shared entry is added
+to the shot's own values. A value that is the same as the shared entry's
+is not, because there is no telling whether it was meant for this shot or
+just read from another episode's. So if your import sets *Colin* as the
+assignee and the shared entry already says *Colin*, the new shot shows no
+assignee in the tracker; values passed when the shot is created are always
+kept whole. Removing a value in Prism doesn't remove it in the tracker.
+
+The one thing the tracker still changes in the shared entry is the "show"
+flag on its comments and FX layers, if an older version left it switched
+on: that makes Prism's own Scene Browser fail when the shot is selected.
+Only that flag is changed; no values are copied in or out.
+
+While it saves to `ProductionTracker_EpisodeShots`, the tracker keeps a
+small `ProductionTracker_EpisodeShots.json.trackerlock` file beside it, so
+two people saving at the same moment take turns. It is removed straight
+after; one left behind by a crash is taken over after about 20 seconds.
 
 ### Before you use it in production
 
@@ -455,7 +508,46 @@ organised — that is the most useful thing you can send.
 
 ## Version history
 
-### v1.1.3 (latest)
+### v1.1.4 (latest)
+
+For projects with episodes. **Update the tracker on every machine** that
+works on such a project: an older tracker still reads and writes the shared
+entries.
+
+- **Fixed:** in a project with episodes made before Prism 2.1.4, shots with
+  the same sequence and shot name in different episodes (`203 / 008 / 050`
+  and `208 / 008 / 050`) shared one set of tracker values. A new shot showed
+  another episode's status, assignee, department and description (*"EXR's
+  uploaded"*), and editing one changed the other. Prism itself keeps these
+  shots in one entry in such projects, so the tracker now keeps each
+  episode's shot in its own file, and no longer writes these shots' values
+  into Prism's shot file.
+- **Fixed:** in a project made with Prism 2.1.4, a shot with no values of its
+  own showed what Prism found under the same sequence and shot name without
+  an episode - possibly another episode's, or a deleted shot's - and the
+  first save copied it into the shot.
+- **Fixed:** deleting a shot in the tracker could remove another episode's
+  values for the shot with the same name. Shared entries are only removed
+  when no other episode has that shot.
+- **What you will see:** shots whose name is used in more than one episode
+  start **blank** in the tracker, as there is no telling whose the stored
+  values are. Set them again by hand where needed; nothing else changes, and
+  Prism's own data is left as it is. A shot whose name only one episode uses
+  keeps showing its values.
+- Prism's own Project Browser keeps showing the old shared values for these
+  shots, since the tracker no longer writes them there.
+- New shots created in Prism start blank in the tracker, and creating,
+  renaming or deleting a shot (in the tracker or in Prism) no longer makes
+  a shot in another episode show different values. Omitted shots and
+  episodes count too.
+- Values changed in Prism's Edit Shot dialog, or set by a script after it
+  creates a shot, still show in the tracker; see [Episodes](#episodes) for
+  the one case where they don't.
+- **New:** the tracker remembers which rows you had open, and opens on the
+  same view next time, per project and per mode. This is kept per user, like
+  the other view settings.
+
+### v1.1.3
 
 Checked against the Prism 2.1.3 source and tested on a Prism 2.1.3 core.
 

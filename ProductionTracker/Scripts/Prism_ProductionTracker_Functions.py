@@ -34,6 +34,7 @@ from qtpy.QtWidgets import *
 
 from PrismUtils.Decorators import err_catcher_plugin as err_catcher
 
+import TrackerEpisodeShots
 import TrackerPrismGuards
 
 
@@ -81,6 +82,13 @@ class Prism_ProductionTracker_Functions(object):
             "postInitialize", self.installGuards, plugin=self.plugin
         )
 
+        # A new shot in a project with episodes starts with its own, empty
+        # tracker data rather than another episode's (TrackerEpisodeShots).
+        # Registered before the change events, so an open tracker syncing on
+        # onShotCreated already finds it.
+        self.core.registerCallback(
+            "onShotCreated", self.onShotCreated, plugin=self.plugin
+        )
         for name in PRISM_CHANGE_EVENTS:
             self.core.registerCallback(name, self.onPrismChanged, plugin=self.plugin)
 
@@ -117,6 +125,16 @@ class Prism_ProductionTracker_Functions(object):
             return _orig(*args, **kwargs)
 
         TrackerPrismGuards.wrapMethod(projects, "changeProject", changeProject)
+
+    def onShotCreated(self, *args, **kwargs):
+        """Prism created a shot that didn't exist: record it as new for the
+        tracker. Runs inside Prism's createShot, so it never raises."""
+        try:
+            entity = TrackerEpisodeShots.entityFrom(args)
+            if entity:
+                TrackerEpisodeShots.markCreated(self.core, dict(entity, type="shot"))
+        except Exception as e:
+            logger.warning("Production Tracker: could not record a new shot: %s", e)
 
     @err_catcher(name=__name__)
     def onPrismChanged(self, *args, **kwargs):
