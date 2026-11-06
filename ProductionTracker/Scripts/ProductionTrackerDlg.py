@@ -342,6 +342,91 @@ class NoScrollComboBox(QComboBox):
         super(NoScrollComboBox, self).keyPressEvent(event)
 
 
+def setComboText(cb, text):
+    """Show `text` in a dropdown. An entry with that text is picked by its
+    index: on an editable dropdown (Assignee) setCurrentText only changes the
+    typed text and leaves the index on another entry, which a number key or
+    a multi-row pick then reads wrong. Text that isn't an entry is typed."""
+    index = cb.findText(text)
+    if index < 0:
+        cb.setCurrentText(text)
+        return
+    if cb.currentIndex() != index:
+        cb.setCurrentIndex(index)
+    if cb.isEditable() and cb.currentText() != text:
+        cb.setEditText(text)
+
+
+def comboNumberIndex(cb, number):
+    """The index number key `number` picks in a dropdown, or -1.
+
+    1-9 are the dropdown's entries in order, leaving out a blank one (the
+    assignee list starts with an empty "nobody" entry); 0 picks that blank
+    entry, where there is one."""
+    blank = -1
+    entries = []
+    for i in range(cb.count()):
+        if cb.itemText(i):
+            entries.append(i)
+        elif blank < 0:
+            blank = i
+    if number == 0:
+        return blank
+    return entries[number - 1] if number <= len(entries) else -1
+
+
+class ComboNumberKeys(QObject):
+    """Pick a dropdown entry by pointing at the dropdown and pressing 1-9
+    (0 for nobody, on the Assignee dropdown).
+
+    Watches the application's key presses while the tracker is shown (see
+    ProductionTrackerDlg.showEvent), since the dropdown under the pointer
+    usually doesn't have the keyboard focus. Keys typed into a text field
+    are left alone, so numbers can still be typed into a description.
+    """
+
+    TEXT_INPUTS = (QLineEdit, QTextEdit, QPlainTextEdit, QAbstractSpinBox)
+
+    def __init__(self, dlg):
+        super(ComboNumberKeys, self).__init__(dlg)
+        self.dlg = dlg
+
+    def eventFilter(self, obj, event):
+        try:
+            if event.type() != QEvent.KeyPress:
+                return False
+            key = event.key()
+            if not (Qt.Key_0 <= key <= Qt.Key_9) or event.isAutoRepeat():
+                return False
+            if event.modifiers() & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier):
+                return False
+            dlg = self.dlg
+            if not dlg.isVisible() or QApplication.activeWindow() is not dlg:
+                return False
+            if not isinstance(obj, QWidget) or obj.window() is not dlg:
+                return False
+            focus = QApplication.focusWidget()
+            # Typing into the Assignee field: its focus is the dropdown itself.
+            if isinstance(focus, self.TEXT_INPUTS) or (
+                isinstance(focus, QComboBox) and focus.isEditable()
+            ):
+                return False
+            cb = QApplication.widgetAt(QCursor.pos())
+            while cb is not None and not isinstance(cb, NoScrollComboBox):
+                cb = cb.parentWidget() if cb is not dlg else None
+            if cb is None or not cb.isEnabled() or not dlg.tree.isAncestorOf(cb):
+                return False
+            index = comboNumberIndex(cb, key - Qt.Key_0)
+            if index < 0:
+                return True
+            setComboText(cb, cb.itemText(index))
+            # As if picked from the list, so a multi-row selection follows.
+            cb.activated.emit(index)
+            return True
+        except Exception:
+            return False
+
+
 class NoScrollDateEdit(QDateEdit):
     """A date edit that ignores the mouse wheel (see NoScrollComboBox).
 
@@ -352,6 +437,10 @@ class NoScrollDateEdit(QDateEdit):
     start on Monday, and the month/year buttons lose the menu arrow that
     Prism's stylesheet draws on top of their text.
     """
+
+    # A day picked in the pop-up calendar: a change the user made, unlike
+    # dateChanged, which also fires when a sync or rebuild sets the date.
+    picked = Signal()
 
     def __init__(self, *args, **kwargs):
         super(NoScrollDateEdit, self).__init__(*args, **kwargs)
@@ -377,6 +466,8 @@ class NoScrollDateEdit(QDateEdit):
         if cal is None:
             return
         cal.setFirstDayOfWeek(Qt.Monday)
+        # Announced once the date edit has taken the day.
+        cal.clicked.connect(lambda _d: QTimer.singleShot(0, self.picked.emit))
         # An empty field parks the value on the minimum date (see the "No
         # date" state in DueDateWidget), which would otherwise open the
         # calendar in January 2000. Watch for the popup opening so it can be
@@ -443,6 +534,9 @@ class NoScrollSpinBox(QSpinBox):
 class DueDateWidget(QWidget):
     """A date picker that supports an empty ('No date') state."""
 
+    # The user picked a day or cleared the date (see NoScrollDateEdit.picked).
+    picked = Signal()
+
     def __init__(self, isoDate=None):
         super(DueDateWidget, self).__init__()
         lo = QHBoxLayout()
@@ -465,6 +559,8 @@ class DueDateWidget(QWidget):
 
         lo.addWidget(self.dateEdit)
         lo.addWidget(self.b_clear)
+        self.dateEdit.picked.connect(self.picked.emit)
+        self.b_clear.clicked.connect(self.picked.emit)
 
         if isoDate:
             d = QDate.fromString(isoDate, "yyyy-MM-dd")
@@ -1487,10 +1583,26 @@ class ProductionTrackerDlg(QDialog):
         self.tree.setHeaderLabels(
             ["Name", "Type", "Description", "Assignee", "Status", "Department", "Frame Range", "Due Date"]
         )
+        tip = (
+            "Point at a dropdown and press 1-9 to pick its entries in order%s.\n"
+            "Ctrl- or Shift-click rows to select several: a pick in one of them "
+            "is made on all of them."
+        )
+        self.tree.headerItem().setToolTip(COL_ASSIGNEE, tip % " (0 for nobody)")
+        for col in (COL_STATUS, COL_DEPARTMENT):
+            self.tree.headerItem().setToolTip(col, tip % "")
+        self.tree.headerItem().setToolTip(
+            COL_DUE,
+            "Ctrl- or Shift-click rows to select several: a day picked (or a date "
+            "cleared) in one of them is set on all of them.",
+        )
         self.tree.setIconSize(QSize(THUMB_W, THUMB_H))
         self.tree.setUniformRowHeights(False)
         self.tree.setAlternatingRowColors(True)
         self.tree.setSelectionBehavior(QAbstractItemView.SelectRows)
+        # Ctrl/Shift-click selects several rows; a pick in one of their
+        # dropdowns (or due dates) is then made on all of them (onCellPicked).
+        self.tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.tree.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.tree.setExpandsOnDoubleClick(True)
         self.tree.setRootIsDecorated(True)
@@ -1584,7 +1696,93 @@ class ProductionTrackerDlg(QDialog):
             "QWidget#cellWrap{background: transparent; border-right:1px solid %s;}"
             % SEPARATOR_COLOR
         )
+        # A pick the user makes (not a value set by a sync or rebuild) goes
+        # to every selected row, see onCellPicked.
+        if isinstance(widget, NoScrollComboBox):
+            widget.activated.connect(lambda _i, w=widget: self.onCellPicked(w))
+        elif isinstance(widget, DueDateWidget):
+            widget.picked.connect(lambda w=widget: self.onCellPicked(w))
         return holder
+
+    # Columns whose value a pick can set on several selected rows at once.
+    PICK_COLUMNS = (COL_ASSIGNEE, COL_STATUS, COL_DEPARTMENT, COL_DUE)
+
+    def rowShown(self, item):
+        """True for a row on screen: not filtered out, and not inside a
+        collapsed folder. Ctrl+A also selects rows you can't see, and a
+        change to several rows should only reach the ones you can."""
+        while item is not None:
+            if item.isHidden():
+                return False
+            parent = item.parent()
+            if parent is not None and not parent.isExpanded():
+                return False
+            item = parent
+        return True
+
+    @err_catcher(name=__name__)
+    def onCellPicked(self, widget):
+        """The user picked a value in a row's dropdown or due date: when that
+        row is one of several selected rows, set the same value on the
+        others. Each changed row then saves as if edited by hand."""
+        if self._building:
+            return
+        selected = [it for it in self.tree.selectedItems() if self.rowShown(it)]
+        if len(selected) < 2:
+            return
+        source = col = None
+        for item in selected:
+            for c in self.PICK_COLUMNS:
+                if self.cellWidget(item, c) is widget:
+                    source, col = item, c
+                    break
+            if source is not None:
+                break
+        if source is None:
+            # A dropdown in a row outside the selection: just that row.
+            return
+
+        isDate = isinstance(widget, DueDateWidget)
+        value = widget.dateEdit.date() if isDate else widget.currentText()
+        changed = skipped = 0
+        for item in selected:
+            if item is source:
+                continue
+            target = self.cellWidget(item, col)
+            if isDate:
+                if not isinstance(target, DueDateWidget) or not target.isEnabled():
+                    continue
+                if target.dateEdit.date() != value:
+                    target.dateEdit.setDate(value)
+                changed += 1
+                continue
+            if not isinstance(target, QComboBox) or not target.isEnabled():
+                continue
+            if target.findText(value) < 0 and not (target.isEditable() and value):
+                # Not offered here: a Prism status on a row with the
+                # tracker's statuses, or a department of the other kind.
+                # (A name typed into an assignee field is typed into the
+                # others too.)
+                skipped += 1
+                continue
+            setComboText(target, value)
+            if target.currentText() == value:
+                changed += 1
+            else:
+                skipped += 1
+
+        name = self.tree.headerItem().text(col)
+        if isDate:
+            shown = "no date" if value == widget.dateEdit.minimumDate() else value.toString("yyyy-MM-dd")
+        else:
+            shown = value or "nobody"
+        text = "%s set to %s on %d selected rows." % (name, shown, changed + 1)
+        if skipped:
+            text += " Not on %d row%s, which %s no such %s." % (
+                skipped, "" if skipped == 1 else "s",
+                "has" if skipped == 1 else "have", name.lower(),
+            )
+        self.l_status.setText(text)
 
     # ---------------------------------------------------------------- data --
     @err_catcher(name=__name__)
@@ -2896,6 +3094,16 @@ class ProductionTrackerDlg(QDialog):
         sel = self.tree.currentItem()
         if sel is not None and (sel.data(0, ROLE_ISLEAF) or sel.data(0, ROLE_ROLLUP)):
             state["selected"] = self.entityKey(sel.data(0, ROLE_ENTITY))
+            # Ctrl-clicking a selected row deselects it but leaves it current.
+            state["currentSelected"] = sel.isSelected()
+        # Every selected row, so a rebuild keeps a multi-row selection. Keyed
+        # like unsaved edits (dirtyKey), so an unsaved new row and a saved
+        # row of the same shot aren't taken for each other.
+        state["selectedAll"] = [
+            self.dirtyKey(it)
+            for it in self.tree.selectedItems()
+            if it.data(0, ROLE_ISLEAF) or it.data(0, ROLE_ROLLUP)
+        ]
         return state
 
     @err_catcher(name=__name__)
@@ -2905,6 +3113,8 @@ class ProductionTrackerDlg(QDialog):
         bases = state.get("base", {})
         applied = set()
         selectItem = None
+        alsoSelected = set(state.get("selectedAll") or ())
+        reselect = []
         for item in self.iterLeafItems() + self.rollupItems():
             entity = item.data(0, ROLE_ENTITY)
             key = self.entityKey(entity)
@@ -2948,6 +3158,8 @@ class ProductionTrackerDlg(QDialog):
                         item.parent().setData(0, ROLE_FXSNAPSHOT, fxSnap)
             if state.get("selected") is not None and key == state["selected"]:
                 selectItem = item
+            if editKey in alsoSelected:
+                reselect.append(item)
 
         # Edits whose row is gone: deleted or renamed elsewhere since. (An
         # unsaved new row is rebuilt from self.newRows, so it is never gone.)
@@ -2979,7 +3191,14 @@ class ProductionTrackerDlg(QDialog):
             self.tree.expandToDepth(3 if self.taskMode() else 2)
 
         if selectItem is not None:
-            self.tree.setCurrentItem(selectItem)
+            if state.get("currentSelected", True):
+                self.tree.setCurrentItem(selectItem)
+            else:
+                self.tree.selectionModel().setCurrentIndex(
+                    self.tree.indexFromItem(selectItem), QItemSelectionModel.NoUpdate
+                )
+        for item in reselect:
+            item.setSelected(True)
 
         self.tree.verticalScrollBar().setValue(state.get("scroll", 0))
 
@@ -3003,7 +3222,7 @@ class ProductionTrackerDlg(QDialog):
                 and key in values
                 and widget.currentText() != values[key]
             ):
-                widget.setCurrentText(values[key])
+                setComboText(widget, values[key])
 
         setCombo(self.cellWidget(item, COL_ASSIGNEE), "assignee")
         statusCb = self.cellWidget(item, COL_STATUS)
@@ -3038,7 +3257,9 @@ class ProductionTrackerDlg(QDialog):
     @err_catcher(name=__name__)
     def updateNotesPanel(self):
         items = self.tree.selectedItems()
-        item = items[0] if items else None
+        # With several rows selected, the one clicked last.
+        current = self.tree.currentItem()
+        item = current if current is not None and current in items else (items[0] if items else None)
         if item is None or not item.data(0, ROLE_ISLEAF):
             self._notesItem = None
             self._notesKey = None
@@ -3935,6 +4156,10 @@ class ProductionTrackerDlg(QDialog):
     @err_catcher(name=__name__)
     def showEvent(self, event):
         super(ProductionTrackerDlg, self).showEvent(event)
+        # Number keys over a dropdown (see ComboNumberKeys), while shown.
+        if getattr(self, "comboNumberKeys", None) is None:
+            self.comboNumberKeys = ComboNumberKeys(self)
+        QApplication.instance().installEventFilter(self.comboNumberKeys)
         if getattr(self, "syncTimer", None) and not self.syncTimer.isActive():
             self.syncTimer.start()
         # The first refresh runs before the window is shown, too early to ask.
@@ -3943,6 +4168,8 @@ class ProductionTrackerDlg(QDialog):
     @err_catcher(name=__name__)
     def hideEvent(self, event):
         if not event.spontaneous():
+            if getattr(self, "comboNumberKeys", None) is not None:
+                QApplication.instance().removeEventFilter(self.comboNumberKeys)
             self.onWindowHidden()
         super(ProductionTrackerDlg, self).hideEvent(event)
 
@@ -4665,7 +4892,7 @@ class ProductionTrackerDlg(QDialog):
                     cb.addItem(icon, current)
                 else:
                     cb.addItem(current)
-            cb.setCurrentText(current)
+            setComboText(cb, current)
         else:
             cb.setCurrentIndex(0)
         cb.currentTextChanged.connect(self.scheduleAutoSave)
@@ -5017,6 +5244,17 @@ class ProductionTrackerDlg(QDialog):
         selectedId = None
         if current is not None and current.parent() is shotItem:
             selectedId = (current.data(0, ROLE_ENTITY) or {}).get("fx_id")
+        # The rest of a multi-row selection: rows elsewhere, and this shot's
+        # FX rows by id, since they are made anew.
+        stillSelected = [
+            it for it in self.tree.selectedItems() if it.parent() is not shotItem
+        ]
+        selectedFx = set(
+            (it.data(0, ROLE_ENTITY) or {}).get("fx_id")
+            for it in self.tree.selectedItems()
+            if it.parent() is shotItem
+        )
+        recreated = []
 
         self._applyingRemote = True
         try:
@@ -5029,6 +5267,8 @@ class ProductionTrackerDlg(QDialog):
                 row = self.addFxLayerItem(shotItem, layer)
                 if layer.get("id") == selectedId:
                     reselect = row
+                if layer.get("id") in selectedFx:
+                    recreated.append(row)
         finally:
             self._applyingRemote = False
 
@@ -5038,6 +5278,9 @@ class ProductionTrackerDlg(QDialog):
             self.tree.setCurrentItem(reselect)
         else:
             self.updateNotesPanel()
+        if len(stillSelected) + len(recreated) > 1:
+            for row in stillSelected + recreated:
+                row.setSelected(True)
 
     @err_catcher(name=__name__)
     def saveAllFxLayers(self):
@@ -5858,6 +6101,7 @@ class ProductionTrackerDlg(QDialog):
         state["dirty"] = dict((remap(k), v) for k, v in state["dirty"].items())
         state["base"] = dict((remap(k), v) for k, v in state.get("base", {}).items())
         state["selected"] = remap(state.get("selected"))
+        state["selectedAll"] = [remap(k) for k in state.get("selectedAll") or ()]
         return state
 
     @err_catcher(name=__name__)

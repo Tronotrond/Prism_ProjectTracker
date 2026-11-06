@@ -1,6 +1,6 @@
 # Production Tracker
 
-[![Version](https://img.shields.io/badge/version-v1.1.4-22c55e.svg)](#version-history)
+[![Version](https://img.shields.io/badge/version-v1.1.5-22c55e.svg)](#version-history)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 [![Prism Pipeline](https://img.shields.io/badge/Prism%20Pipeline-2.x-6366f1.svg)](https://prism-pipeline.com)
 [![Buy Me A Coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-5F7FFF.svg?logo=buymeacoffee&logoColor=white)](https://www.buymeacoffee.com/tronotrond)
@@ -12,7 +12,7 @@ status, assignee, department, frame range, due date — plus threaded comments
 with to-dos, @mentions and reminder subscriptions. Everything is stored in the
 project itself, so there is no server to run and no database to maintain.
 
-**Latest version: v1.1.4** — see [Version history](#version-history) for what
+**Latest version: v1.1.5** — see [Version history](#version-history) for what
 changed.
 
 > **Status:** used in production here, but this is a personal project rather
@@ -65,6 +65,10 @@ changed.
   or folder offers to create into it (pre-filling the sequence or asset
   folder), a row offers actions on that row.
 - Context menu shortcuts to the entity folder, render folder and comp folder.
+- **Change several rows at once**: Ctrl- or Shift-click rows, then pick a
+  status, assignee, department or due date in one of them.
+- **Number keys**: point at a dropdown and press 1-9 to pick its entries
+  (0 for nobody on Assignee).
 
 **Comments**
 
@@ -508,7 +512,22 @@ organised — that is the most useful thing you can send.
 
 ## Version history
 
-### v1.1.4 (latest)
+### v1.1.5 (latest)
+
+- **New:** change several rows at once. Ctrl-click (or Shift-click) rows to
+  select them, then pick a Status, Assignee, Department or due date in one
+  of them: it is set on all the selected rows, and each saves as if edited
+  by hand. Only rows you can see are changed (not ones hidden by the filter
+  or inside a closed folder); a row that has no such choice (a Prism status
+  on a row with the tracker's statuses, say) is left as it is, and the
+  status bar says how many were changed.
+- **New:** point at a Status, Assignee or Department dropdown and press
+  **1-9** to pick its entries in order, without opening it. On Assignee,
+  **0** picks nobody. With several rows selected, this sets them all too.
+  Numbers typed into a text field (a description, the Assignee field while
+  typing a name) are typed as usual.
+
+### v1.1.4
 
 For projects with episodes. **Update the tracker on every machine** that
 works on such a project: an older tracker still reads and writes the shared
